@@ -1,8 +1,8 @@
 /*
- * acid-hdr.c  — apply cinema-night acid color pipeline via KMS atomic
+ * acid-hdr.c  — HDR10 + BT.2020 color pipeline injector via KMS atomic
  *
  * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
- * Sets DEGAMMA_LUT + CTM + GAMMA_LUT + HDR_OUTPUT_METADATA + Colorspace.
+ * Sets CTM (BT.709→BT.2020 gamut expansion) + HDR_OUTPUT_METADATA + Colorspace.
  * Properties persist after we release master (Smithay doesn't touch them).
  *
  * Build:
@@ -28,81 +28,21 @@
 #include <xf86drmMode.h>
 #include <drm_mode.h>
 
-/* ── tuning — "cinema night" B50/C70/S45, vivid TV-store punch ──────────── */
-#define BRIGHTNESS    1.00   /* full panel headroom                            */
-#define CONTRAST_STR  0.15   /* gentle S-curve — don't crush shadows           */
-#define LUT_SIZE      4096
+/* ── config ──────────────────────────────────────────────────────────────── */
 #define DRM_DEV       "/dev/dri/card1"
 
 /*
- * Standard saturation matrix S=1.55, BT.709 luma [0.2126,0.7152,0.0722].
- * M[i][j] = (1-S)*luma[j] + (S if i==j else 0), plus a cool/crisp tilt:
- * +0.08 on blue diagonal (TV stores always push blue), -0.03 off R diagonal.
- * Gives the "vivid/dynamic" preset look — saturated, cool-white, punchy.
+ * BT.709 → BT.2020 gamut expansion matrix.
+ * Derived from: (BT.2020←XYZ) × (XYZ←BT.709), D65 whitepoint.
+ * Correct colourimetric expansion — white stays white, no saturation pumping.
+ * Required when Colorspace=BT2020_RGB so the TV decodes colours correctly.
  */
-static const double ACID_CTM[3][3] = {
-    { 1.403, -0.393, -0.040 },   /* R channel: vivid, slight roll-off */
-    {-0.117,  1.157, -0.040 },   /* G channel: vivid neutral           */
-    {-0.117, -0.393,  1.590 },   /* B channel: vivid + +0.08 cool push */
+static const double CTM_709_TO_2020[3][3] = {
+    { 0.627504,  0.329275,  0.043303 },
+    { 0.069108,  0.919519,  0.011360 },
+    { 0.016394,  0.088011,  0.895380 },
 };
 /* ─────────────────────────────────────────────────────────────────────────── */
-
-/* ── math helpers ────────────────────────────────────────────────────────── */
-static double srgb_inv(double x) {
-    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
-}
-static double srgb_enc(double x) {
-    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0/2.4) - 0.055;
-}
-static double clamp(double v, double lo, double hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-/* drm_color_lut: r u16, g u16, b u16, reserved u16 per entry */
-typedef struct { uint16_t r, g, b, pad; } drm_lut_entry;
-
-static drm_lut_entry *build_degamma(int n) {
-    drm_lut_entry *lut = calloc(n, sizeof(*lut));
-    for (int i = 0; i < n; i++) {
-        double x = (double)i / (n - 1);
-        uint16_t v = (uint16_t)(clamp(srgb_inv(x), 0, 1) * 65535.0 + 0.5);
-        lut[i].r = lut[i].g = lut[i].b = v;
-    }
-    return lut;
-}
-
-static drm_lut_entry *build_gamma_acid(int n) {
-    /* pre-compute s-curve on a linear sweep */
-    double *sig = malloc(n * sizeof(double));
-    for (int i = 0; i < n; i++) {
-        double t = (double)i / (n - 1);
-        sig[i] = 1.0 / (1.0 + exp(-12.0 * (t - 0.5)));
-    }
-    double sig0 = sig[0], sig1 = sig[n-1];
-
-    drm_lut_entry *lut = calloc(n, sizeof(*lut));
-    for (int i = 0; i < n; i++) {
-        double x = (double)i / (n - 1);
-        /* contrast S-curve */
-        double s = (sig[i] - sig0) / (sig1 - sig0);
-        double y = (1.0 - CONTRAST_STR) * x + CONTRAST_STR * s;
-        /* brightness ceiling */
-        y *= BRIGHTNESS;
-        uint16_t v = (uint16_t)(clamp(srgb_enc(y), 0, 1) * 65535.0 + 0.5);
-        lut[i].r = lut[i].g = lut[i].b = v;
-    }
-    free(sig);
-    return lut;
-}
-
-static drm_lut_entry *build_linear(int n) {
-    drm_lut_entry *lut = calloc(n, sizeof(*lut));
-    for (int i = 0; i < n; i++) {
-        uint16_t v = (uint16_t)((double)i / (n - 1) * 65535.0 + 0.5);
-        lut[i].r = lut[i].g = lut[i].b = v;
-    }
-    return lut;
-}
 
 /* drm_color_ctm: 9 × S31.32 (bit63=sign, bits[62:0]=unsigned magnitude) */
 static void build_ctm(const double m[3][3], uint64_t out[9]) {
@@ -140,22 +80,24 @@ typedef struct {
 
 static hdr_meta_t build_hdr_meta(void) {
     hdr_meta_t m = {0};
-    m.metadata_type = 0; /* HDMI_STATIC_METADATA_TYPE1 */
-    m.eotf = 2;          /* PQ */
+    m.metadata_type = 0;  /* HDMI_STATIC_METADATA_TYPE1 */
+    m.eotf = 2;           /* PQ / ST2084 */
     m.metadata_descriptor = 0;
-    /* BT.2020 primaries × 50000: G(0.170,0.797) B(0.131,0.046) R(0.708,0.292) */
-    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000);
-    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000);
-    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000);
-    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000);
-    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000);
-    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000);
-    m.white_point[0] = (uint16_t)(0.3127 * 50000);
+    /* BT.2020 primaries × 50000 (CTA-861 order: G, B, R) */
+    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000);  /* G x */
+    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000);  /* G y */
+    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000);  /* B x */
+    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000);  /* B y */
+    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000);  /* R x */
+    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000);  /* R y */
+    m.white_point[0] = (uint16_t)(0.3127 * 50000);          /* D65 */
     m.white_point[1] = (uint16_t)(0.3290 * 50000);
-    m.max_display_mastering_luminance = 1000;
-    m.min_display_mastering_luminance = (uint16_t)(0.005 * 10000);
-    m.max_content_light_level = 1000;
-    m.max_frame_average_light_level = 200;
+    /* HDR10 reference mastering display — forces the TV's tone-mapper to open up fully.
+     * 10000 nit peak + 0.0001 nit OLED black = maximum contrast range declaration. */
+    m.max_display_mastering_luminance = 10000;               /* cd/m² units × 1    */
+    m.min_display_mastering_luminance = 1;                   /* 0.0001 cd/m² × 10k */
+    m.max_content_light_level = 10000;                       /* MaxCLL: HDR10 max  */
+    m.max_frame_average_light_level = 400;                   /* MaxFALL: typical scene */
     return m;
 }
 
@@ -271,20 +213,11 @@ int main(int argc, char **argv) {
     }
     printf("connector=%u  CRTC=%u\n", conn_id, crtc_id);
 
-    /* Build data */
-    drm_lut_entry *deg_lut, *gam_lut;
     uint64_t ctm9[9];
-    if (reset) {
-        deg_lut = build_linear(LUT_SIZE);
-        gam_lut = build_linear(LUT_SIZE);
+    if (reset)
         build_ctm_identity(ctm9);
-    } else {
-        deg_lut = build_degamma(LUT_SIZE);
-        gam_lut = build_gamma_acid(LUT_SIZE);
-        build_ctm((const double(*)[3])ACID_CTM, ctm9);
-    }
-
-    free(deg_lut); free(gam_lut); /* not used — CTM-only, DEGAMMA/GAMMA disabled */
+    else
+        build_ctm((const double(*)[3])CTM_709_TO_2020, ctm9);
 
     uint32_t ctm_blob = mk_blob(fd, ctm9, sizeof(ctm9));
     printf("CTM blob=%u\n", ctm_blob);
@@ -367,7 +300,7 @@ int main(int argc, char **argv) {
         if (reset)
             printf("✓ reset: linear gamma + SDR restored\n");
         else
-            printf("✓ acid cinema-night ACTIVE: DEGAMMA+CTM+GAMMA+HDR10+BT2020\n"
+            printf("✓ HDR10 ACTIVE: CTM(BT.709→BT.2020) + BT2020_RGB + 10000nit metadata\n"
                    "  TV should show HDR badge. Properties persist until reset.\n");
     } else {
         printf("color LUT ret=%d  HDR ret=%d\n", ret, hdr_ret);
