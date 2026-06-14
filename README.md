@@ -1,4 +1,4 @@
-# acid-hdr
+# cosmic-hdr
 
 KMS/DRM color pipeline injector for Linux Wayland compositors that don't expose color management — tested on COSMIC (cosmic-comp / Smithay).
 
@@ -10,7 +10,7 @@ Works by briefly switching VTs so the compositor drops DRM master, taking master
 
 - **CTM only** — DEGAMMA/GAMMA bypassed to avoid darkening. Saturation matrix S≈1.55 with a cool blue tilt applied in the GPU color pipeline.
 - **HDR10 metadata** — attempts to send SMPTE ST2086 static metadata + `BT2020_RGB` colorspace to trigger the display's HDR mode (requires `ALLOW_MODESET`; may fail depending on driver/display).
-- **Persistent** — properties survive compositor repaints. Reset with `acid-hdr reset`.
+- **Persistent** — properties survive compositor repaints. Reset with `cosmic-hdr reset`.
 
 ## Requirements
 
@@ -29,32 +29,32 @@ sudo make install
 ## Usage
 
 ```bash
-sudo acid-hdr          # apply vivid color pipeline
-sudo acid-hdr reset    # restore defaults
+sudo cosmic-hdr          # apply vivid color pipeline
+sudo cosmic-hdr reset    # restore defaults
 ```
 
 ## Autostart (systemd)
 
 ```bash
-sudo tee /etc/systemd/system/acid-hdr.service > /dev/null << 'EOF'
+sudo tee /etc/systemd/system/cosmic-hdr.service > /dev/null << 'EOF'
 [Unit]
-Description=acid-hdr vivid color pipeline
+Description=cosmic-hdr vivid color pipeline
 After=graphical.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/acid-hdr
+ExecStart=/usr/local/bin/cosmic-hdr
 RemainAfterExit=yes
 
 [Install]
 WantedBy=graphical.target
 EOF
-sudo systemctl enable --now acid-hdr.service
+sudo systemctl enable --now cosmic-hdr.service
 ```
 
 ## Tuning
 
-Edit `acid-hdr.c`:
+Edit `cosmic-hdr.c`:
 
 | constant | default | effect |
 |---|---|---|

@@ -1,16 +1,16 @@
 /*
- * acid-hdr.c  — HDR10 + BT.2020 color pipeline injector via KMS atomic
+ * cosmic-hdr.c  — HDR10 + BT.2020 color pipeline injector via KMS atomic
  *
  * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
  * Sets CTM (BT.709→BT.2020 gamut expansion) + HDR_OUTPUT_METADATA + Colorspace.
  * Properties persist after we release master (Smithay doesn't touch them).
  *
  * Build:
- *   cc -O2 -o ~/.local/bin/acid-hdr $(pkg-config --cflags --libs libdrm) ~/.local/bin/acid-hdr.c -lm
+ *   cc -O2 -o ~/.local/bin/cosmic-hdr $(pkg-config --cflags --libs libdrm) ~/.local/bin/cosmic-hdr.c -lm
  *
  * Usage (must be root):
- *   sudo acid-hdr          apply
- *   sudo acid-hdr reset    restore linear + SDR
+ *   sudo cosmic-hdr          apply
+ *   sudo cosmic-hdr reset    restore linear + SDR
  */
 
 #include <stdio.h>
@@ -30,12 +30,32 @@
 
 /* ── config ──────────────────────────────────────────────────────────────── */
 #define DRM_DEV       "/dev/dri/card1"
+#define CONF_PATH     "/etc/cosmic-hdr.conf"
 
-/* A85H OLED peak brightness. Controls tone-mapper aggression:
- * - Too high (10000) → TV boosts everything, too bright on desktop.
- * - Match to display peak → near 1:1 mapping, natural HDR look.
- * Hisense A85H spec: ~800 nits typical, ~1000 nits peak boost. */
-#define DISPLAY_PEAK_NITS  1000
+/* Defaults — overridden by /etc/cosmic-hdr.conf */
+#define DEFAULT_PEAK_NITS    400   /* see note below */
+#define DEFAULT_GAMUT        100   /* 0=identity  100=full BT.2020 expansion */
+
+/* MaxCLL declared to the TV. Controls tone-mapper aggression on desktop.
+ * We're sending sRGB content labeled HDR10/PQ — the TV applies PQ decoding,
+ * which reads sRGB mid-tones as very high luminance. Keep this LOW (~SDR
+ * white range) so the TV doesn't boost. For games, Gamescope overrides this
+ * with its own metadata automatically.
+ * Default 400 = SDR-ish desktop, HDR mode active, good blacks, no blow-out. */
+
+static void load_conf(int *peak_nits, int *gamut_pct) {
+    *peak_nits = DEFAULT_PEAK_NITS;
+    *gamut_pct = DEFAULT_GAMUT;
+    FILE *f = fopen(CONF_PATH, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "PEAK_NITS=%d", &v) == 1) *peak_nits = v;
+        if (sscanf(line, "GAMUT=%d",     &v) == 1) *gamut_pct = v;
+    }
+    fclose(f);
+}
 
 /*
  * BT.709 → BT.2020 gamut expansion matrix.
@@ -84,7 +104,7 @@ typedef struct {
     uint16_t max_frame_average_light_level;
 } hdr_meta_t;
 
-static hdr_meta_t build_hdr_meta(void) {
+static hdr_meta_t build_hdr_meta(int peak_nits) {
     hdr_meta_t m = {0};
     m.metadata_type = 0;  /* HDMI_STATIC_METADATA_TYPE1 */
     m.eotf = 2;           /* PQ / ST2084 */
@@ -98,12 +118,10 @@ static hdr_meta_t build_hdr_meta(void) {
     m.display_primaries[2][1] = (uint16_t)(0.292 * 50000);  /* R y */
     m.white_point[0] = (uint16_t)(0.3127 * 50000);          /* D65 */
     m.white_point[1] = (uint16_t)(0.3290 * 50000);
-    /* Declare mastering at the display's own peak so the tone-mapper is near 1:1.
-     * MaxCLL == display peak = no aggressive boost; OLED black = max contrast ratio. */
-    m.max_display_mastering_luminance = DISPLAY_PEAK_NITS;   /* cd/m² units × 1    */
-    m.min_display_mastering_luminance = 1;                   /* 0.0001 cd/m² × 10k */
-    m.max_content_light_level = DISPLAY_PEAK_NITS;           /* MaxCLL             */
-    m.max_frame_average_light_level = 200;                   /* MaxFALL            */
+    m.max_display_mastering_luminance = (uint16_t)peak_nits;
+    m.min_display_mastering_luminance = 1;                   /* 0.0001 cd/m² — OLED black */
+    m.max_content_light_level        = (uint16_t)peak_nits;
+    m.max_frame_average_light_level  = (uint16_t)(peak_nits / 2);
     return m;
 }
 
@@ -164,7 +182,11 @@ static int vt_switch(int tty_fd, int target_vt) {
 int main(int argc, char **argv) {
     int reset = (argc >= 2 && strcmp(argv[1], "reset") == 0);
 
-    if (geteuid() != 0) { fprintf(stderr, "run as root: sudo acid-hdr\n"); return 1; }
+    int peak_nits, gamut_pct;
+    load_conf(&peak_nits, &gamut_pct);
+    printf("config: peak_nits=%d  gamut=%d%%\n", peak_nits, gamut_pct);
+
+    if (geteuid() != 0) { fprintf(stderr, "run as root: sudo cosmic-hdr\n"); return 1; }
 
     /* ── VT switch: move off TTY1 so COSMIC drops DRM master ──────────── */
     int tty_fd = open("/dev/tty1", O_RDWR | O_NOCTTY | O_CLOEXEC);
@@ -219,11 +241,18 @@ int main(int argc, char **argv) {
     }
     printf("connector=%u  CRTC=%u\n", conn_id, crtc_id);
 
+    /* Blend CTM: 0% = identity, 100% = full BT.709→BT.2020 expansion */
     uint64_t ctm9[9];
-    if (reset)
+    if (reset) {
         build_ctm_identity(ctm9);
-    else
-        build_ctm((const double(*)[3])CTM_709_TO_2020, ctm9);
+    } else {
+        double t = gamut_pct / 100.0;
+        double blended[3][3];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+                blended[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + CTM_709_TO_2020[r][c] * t;
+        build_ctm((const double(*)[3])blended, ctm9);
+    }
 
     uint32_t ctm_blob = mk_blob(fd, ctm9, sizeof(ctm9));
     printf("CTM blob=%u\n", ctm_blob);
@@ -252,7 +281,7 @@ int main(int argc, char **argv) {
         uint64_t cspace_val = reset ? 0
             : get_enum_val(fd, p_cspace, "BT2020_RGB");
 
-        hdr_meta_t hdr_m = build_hdr_meta();
+        hdr_meta_t hdr_m = build_hdr_meta(peak_nits);
         uint32_t hdr_blob = (reset || cspace_val == 0) ? 0
             : mk_blob(fd, &hdr_m, sizeof(hdr_m));
 
