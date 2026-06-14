@@ -60,16 +60,18 @@
 #define DEFAULT_SDR_NITS   203
 #define DEFAULT_PEAK_NITS  800
 #define DEFAULT_GAMUT      100
-#define DEFAULT_GAMUT_MODE 0   /* 0=BT.2020, 1=DCI-P3 */
-#define DEFAULT_MAX_BPC    10
+#define DEFAULT_GAMUT_MODE  0   /* 0=BT.2020, 1=DCI-P3 */
+#define DEFAULT_MAX_BPC     10
+#define DEFAULT_SATURATION  100 /* 100 = neutral; 150 = vivid; 50 = desaturated */
 
 static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
-                      int *gamut_mode, int *max_bpc) {
+                      int *gamut_mode, int *max_bpc, int *saturation) {
     *sdr_nits   = DEFAULT_SDR_NITS;
     *peak_nits  = DEFAULT_PEAK_NITS;
     *gamut_pct  = DEFAULT_GAMUT;
     *gamut_mode = DEFAULT_GAMUT_MODE;
     *max_bpc    = DEFAULT_MAX_BPC;
+    *saturation = DEFAULT_SATURATION;
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
@@ -79,6 +81,7 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
         if (sscanf(line, "PEAK_NITS=%d",    &v) == 1) *peak_nits  = v;
         if (sscanf(line, "GAMUT=%d",        &v) == 1) *gamut_pct  = v;
         if (sscanf(line, "MAX_BPC=%d",      &v) == 1) *max_bpc    = v;
+        if (sscanf(line, "SATURATION=%d",   &v) == 1) *saturation = v;
         if (sscanf(line, "GAMUT_MODE=%63s", s)  == 1)
             *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
     }
@@ -86,12 +89,13 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
 }
 
 static void save_conf(int sdr_nits, int peak_nits, int gamut_pct,
-                      int gamut_mode, int max_bpc) {
+                      int gamut_mode, int max_bpc, int saturation) {
     FILE *f = fopen(CONF_PATH, "w");
     if (!f) { perror("save_conf: fopen " CONF_PATH); return; }
-    fprintf(f, "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\nGAMUT_MODE=%s\n",
+    fprintf(f, "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\nGAMUT_MODE=%s\nSATURATION=%d\n",
             sdr_nits, peak_nits, gamut_pct, max_bpc,
-            gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"));
+            gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
+            saturation);
     fclose(f);
     printf("saved: %s\n", CONF_PATH);
 }
@@ -266,6 +270,23 @@ static void build_ctm_identity(uint64_t out[9]) {
     build_ctm(id, out);
 }
 
+/* BT.709 saturation matrix. s=1.0 → identity; s>1 → vivid; s<1 → desaturated. */
+static void build_sat_mat(double s, double out[3][3]) {
+    double Ry = 0.2126, Gy = 0.7152, By = 0.0722;
+    out[0][0] = (1-s)*Ry + s; out[0][1] = (1-s)*Gy;      out[0][2] = (1-s)*By;
+    out[1][0] = (1-s)*Ry;     out[1][1] = (1-s)*Gy + s;  out[1][2] = (1-s)*By;
+    out[2][0] = (1-s)*Ry;     out[2][1] = (1-s)*Gy;      out[2][2] = (1-s)*By + s;
+}
+
+/* out = a × b  (3×3 matrix multiply) */
+static void mat_mul_3x3(const double a[3][3], const double b[3][3], double out[3][3]) {
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) {
+            out[r][c] = 0;
+            for (int k = 0; k < 3; k++) out[r][c] += a[r][k] * b[k][c];
+        }
+}
+
 /* ── HDR10 metadata ──────────────────────────────────────────────────────── */
 /* Mirrors struct hdr_output_metadata from <drm/drm_mode.h>. sizeof == 32. */
 typedef struct {
@@ -403,6 +424,7 @@ static void usage(const char *argv0) {
         "  --peak-nits N            Display peak luminance in nits (default: EDID or 800)\n"
         "  --gamut N                Gamut expansion blend 0-100%% (default 100)\n"
         "  --gamut-mode MODE        bt2020 | dci-p3 | srgb (default: from EDID colorimetry)\n"
+        "  --saturation N           Color intensity 50-200%% (100=neutral, 150=vivid; default 100)\n"
         "  --bpc N                  Output bit depth: 8, 10, or 12 (default 10)\n"
         "  --no-vt-switch           Skip VT2 switch — try direct DRM master (headless / boot use)\n"
         "  reset                    Restore SDR (identity pipeline)\n"
@@ -416,10 +438,10 @@ static void usage(const char *argv0) {
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    int reset = 0, save = 0, sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc;
+    int reset = 0, save = 0, sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct;
     int no_vt_switch = 0;
     int explicit_peak = 0, explicit_gamut_mode = 0;
-    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc);
+    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc, &saturation_pct);
 
     char card_path[64] = {0};
     char conn_override[64] = {0};
@@ -447,6 +469,7 @@ int main(int argc, char **argv) {
                          strcmp(m, "srgb")   == 0 ? 2 : 0;
             explicit_gamut_mode = 1;
         }
+        else if (strcmp(argv[i], "--saturation") == 0 && i+1 < argc) saturation_pct = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg: %s  (try --help)\n", argv[i]); return 1; }
     }
 
@@ -454,7 +477,7 @@ int main(int argc, char **argv) {
 
     /* Save config before applying if requested */
     if (save && !reset)
-        save_conf(sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc);
+        save_conf(sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct);
 
     /* Auto-detect DRM device if not specified */
     char auto_conn[64] = {0};
@@ -498,9 +521,9 @@ int main(int argc, char **argv) {
     const char *gmode_str = gamut_mode == 1 ? "DCI-P3" :
                             gamut_mode == 2 ? "sRGB"   : "BT.2020";
     printf("card: %s  connector: %s\n"
-           "config: sdr_nits=%d  peak_nits=%d  gamut=%d%%  mode=%s  bpc=%d\n",
+           "config: sdr_nits=%d  peak_nits=%d  gamut=%d%%  mode=%s  bpc=%d  saturation=%d%%\n",
            card_path, want_conn ? want_conn : "any",
-           sdr_nits, peak_nits, gamut_pct, gmode_str, max_bpc);
+           sdr_nits, peak_nits, gamut_pct, gmode_str, max_bpc, saturation_pct);
 
     int tty_fd = -1;
     if (!no_vt_switch) {
@@ -619,13 +642,20 @@ int main(int argc, char **argv) {
     } else {
         deg_lut = build_degamma_srgb(LUT_SIZE);
         gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits);
+        /* Build gamut expansion matrix (identity → target, blended by gamut_pct). */
         double t = gamut_pct / 100.0;
-        double blended[3][3];
+        double gamut_mat[3][3];
         const double (*target)[3] = (gamut_mode == 1) ? CTM_709_TO_DCIP3 : CTM_709_TO_2020;
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 3; c++)
-                blended[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + target[r][c] * t;
-        build_ctm((const double(*)[3])blended, ctm9);
+                gamut_mat[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + target[r][c] * t;
+        /* Apply saturation matrix first (in sRGB linear), then gamut expansion:
+         * combined = gamut_mat × sat_mat  (right-to-left in transform order). */
+        double sat_mat[3][3];
+        build_sat_mat(saturation_pct / 100.0, sat_mat);
+        double combined[3][3];
+        mat_mul_3x3(gamut_mat, sat_mat, combined);
+        build_ctm((const double(*)[3])combined, ctm9);
     }
 
     uint32_t deg_blob = mk_blob(fd, deg_lut, LUT_SIZE * sizeof(drm_lut_entry));
@@ -767,8 +797,8 @@ int main(int argc, char **argv) {
                    sdr_nits, peak_nits, max_bpc);
         } else {
             printf("✓ HDR10 ACTIVE: sRGB→linear→%s→PQ pipeline live\n"
-                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%  bpc=%d\n",
-                   gmode_str, sdr_nits, peak_nits, gamut_pct, max_bpc);
+                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%  saturation=%d%%  bpc=%d\n",
+                   gmode_str, sdr_nits, peak_nits, gamut_pct, saturation_pct, max_bpc);
         }
 
         /* HDMI-CEC: announce active source so the TV switches input automatically */
