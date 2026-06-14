@@ -52,10 +52,50 @@
 #define DEFAULT_MAX_BPC       10
 #define DEFAULT_SATURATION    100  /* 100 = neutral */
 #define DEFAULT_MIDTONE_GAMMA 100  /* 100 = neutral; >100 = HDR punch; <100 = lift */
+#define DEFAULT_WHITE_TEMP    6504 /* D65 = neutral white point (Kelvin) */
+#define DEFAULT_WHITE_TINT    0    /* -50..+50, green(-)/magenta(+); 0 = neutral */
+#define DEFAULT_BLACK_LIFT    0    /* 0..100, lifts shadow floor; 0 = pure black */
+#define DEFAULT_TONEMAP       0    /* 0 = clip highlights, 1 = soft roll-off */
+#define DEFAULT_TONEMAP_KNEE  50   /* 0..100, roll-off start point (% of range) */
 
 /* ── daemon signal state ──────────────────────────────────────────────────── */
 static volatile sig_atomic_t g_reload = 0;
 static void sigusr1_handler(int s) { (void)s; g_reload = 1; }
+
+/* ── persisted configuration ──────────────────────────────────────────────── */
+typedef struct {
+    int sdr_nits;
+    int peak_nits;
+    int gamut_pct;
+    int gamut_mode;      /* 0=BT.2020, 1=DCI-P3, 2=sRGB */
+    int max_bpc;
+    int saturation;
+    int oled_dim_min;
+    int midtone_gamma;
+    int force_oled;
+    int white_temp;      /* Kelvin; 6504 = D65 neutral */
+    int white_tint;      /* -50..+50 green/magenta */
+    int black_lift;      /* 0..100 shadow floor lift */
+    int tonemap;         /* 0=clip, 1=soft roll-off */
+    int tonemap_knee;    /* 0..100 roll-off start */
+} KmsConf;
+
+static void conf_defaults(KmsConf *c) {
+    c->sdr_nits      = DEFAULT_SDR_NITS;
+    c->peak_nits     = DEFAULT_PEAK_NITS;
+    c->gamut_pct     = DEFAULT_GAMUT;
+    c->gamut_mode    = DEFAULT_GAMUT_MODE;
+    c->max_bpc       = DEFAULT_MAX_BPC;
+    c->saturation    = DEFAULT_SATURATION;
+    c->oled_dim_min  = 0;
+    c->midtone_gamma = DEFAULT_MIDTONE_GAMMA;
+    c->force_oled    = 0;
+    c->white_temp    = DEFAULT_WHITE_TEMP;
+    c->white_tint    = DEFAULT_WHITE_TINT;
+    c->black_lift    = DEFAULT_BLACK_LIFT;
+    c->tonemap       = DEFAULT_TONEMAP;
+    c->tonemap_knee  = DEFAULT_TONEMAP_KNEE;
+}
 
 /* ── apply context ────────────────────────────────────────────────────────── */
 typedef struct {
@@ -70,60 +110,77 @@ typedef struct {
     int  max_bpc;
     int  saturation_pct;
     int  midtone_gamma;
+    int  white_temp;
+    int  white_tint;
+    int  black_lift;
+    int  tonemap;
+    int  tonemap_knee;
     int  explicit_peak;
     int  explicit_gamut_mode;
 } ApplyCtx;
 
 /* ── conf I/O ────────────────────────────────────────────────────────────── */
-static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
-                      int *gamut_mode, int *max_bpc, int *saturation,
-                      int *oled_dim_min, int *midtone_gamma, int *force_oled) {
-    *sdr_nits      = DEFAULT_SDR_NITS;
-    *peak_nits     = DEFAULT_PEAK_NITS;
-    *gamut_pct     = DEFAULT_GAMUT;
-    *gamut_mode    = DEFAULT_GAMUT_MODE;
-    *max_bpc       = DEFAULT_MAX_BPC;
-    *saturation    = DEFAULT_SATURATION;
-    *oled_dim_min  = 0;
-    *midtone_gamma = DEFAULT_MIDTONE_GAMMA;
-    *force_oled    = 0;
+static void load_conf(KmsConf *c) {
+    conf_defaults(c);
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int v; char s[64];
-        if (sscanf(line, "SDR_NITS=%d",      &v) == 1) *sdr_nits      = v;
-        if (sscanf(line, "PEAK_NITS=%d",     &v) == 1) *peak_nits     = v;
-        if (sscanf(line, "GAMUT=%d",         &v) == 1) *gamut_pct     = v;
-        if (sscanf(line, "MAX_BPC=%d",       &v) == 1) *max_bpc       = v;
-        if (sscanf(line, "SATURATION=%d",    &v) == 1) *saturation    = v;
-        if (sscanf(line, "OLED_DIM_MIN=%d",  &v) == 1) *oled_dim_min  = v;
-        if (sscanf(line, "MIDTONE_GAMMA=%d", &v) == 1) *midtone_gamma = v;
-        if (sscanf(line, "FORCE_OLED=%d",    &v) == 1) *force_oled    = v;
+        if (sscanf(line, "SDR_NITS=%d",      &v) == 1) c->sdr_nits      = v;
+        if (sscanf(line, "PEAK_NITS=%d",     &v) == 1) c->peak_nits     = v;
+        if (sscanf(line, "GAMUT=%d",         &v) == 1) c->gamut_pct     = v;
+        if (sscanf(line, "MAX_BPC=%d",       &v) == 1) c->max_bpc       = v;
+        if (sscanf(line, "SATURATION=%d",    &v) == 1) c->saturation    = v;
+        if (sscanf(line, "OLED_DIM_MIN=%d",  &v) == 1) c->oled_dim_min  = v;
+        if (sscanf(line, "MIDTONE_GAMMA=%d", &v) == 1) c->midtone_gamma = v;
+        if (sscanf(line, "FORCE_OLED=%d",    &v) == 1) c->force_oled    = v;
+        if (sscanf(line, "WHITE_TEMP=%d",    &v) == 1) c->white_temp    = v;
+        if (sscanf(line, "WHITE_TINT=%d",    &v) == 1) c->white_tint    = v;
+        if (sscanf(line, "BLACK_LIFT=%d",    &v) == 1) c->black_lift    = v;
+        if (sscanf(line, "TONEMAP=%d",       &v) == 1) c->tonemap       = v;
+        if (sscanf(line, "TONEMAP_KNEE=%d",  &v) == 1) c->tonemap_knee  = v;
         if (sscanf(line, "GAMUT_MODE=%63s",   s) == 1)
-            *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
+            c->gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 :
+                            (strncmp(s, "srgb",   4) == 0) ? 2 : 0;
     }
     fclose(f);
 }
 
-static void save_conf(int sdr_nits, int peak_nits, int gamut_pct,
-                      int gamut_mode, int max_bpc, int saturation,
-                      int oled_dim_min, int midtone_gamma, int force_oled) {
+static void save_conf(const KmsConf *c) {
     const char *tmp = CONF_PATH ".tmp";
     FILE *f = fopen(tmp, "w");
     if (!f) { perror("save_conf: fopen " CONF_PATH ".tmp"); return; }
     int n = fprintf(f,
         "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\n"
-        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\nFORCE_OLED=%d\n",
-        sdr_nits, peak_nits, gamut_pct, max_bpc,
-        gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
-        saturation, oled_dim_min, midtone_gamma, force_oled);
+        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\nFORCE_OLED=%d\n"
+        "WHITE_TEMP=%d\nWHITE_TINT=%d\nBLACK_LIFT=%d\nTONEMAP=%d\nTONEMAP_KNEE=%d\n",
+        c->sdr_nits, c->peak_nits, c->gamut_pct, c->max_bpc,
+        c->gamut_mode == 1 ? "dci-p3" : (c->gamut_mode == 2 ? "srgb" : "bt2020"),
+        c->saturation, c->oled_dim_min, c->midtone_gamma, c->force_oled,
+        c->white_temp, c->white_tint, c->black_lift, c->tonemap, c->tonemap_knee);
     if (n < 0) { perror("save_conf: fprintf"); fclose(f); unlink(tmp); return; }
     fflush(f);
     fsync(fileno(f));
     if (fclose(f) != 0) { perror("save_conf: fclose"); unlink(tmp); return; }
     if (rename(tmp, CONF_PATH) != 0) { perror("save_conf: rename"); unlink(tmp); return; }
     printf("saved: %s\n", CONF_PATH);
+}
+
+/* Copy persisted conf values into an apply context (leaves card/connector/flags). */
+static void ctx_apply_conf(ApplyCtx *ctx, const KmsConf *c) {
+    ctx->sdr_nits       = c->sdr_nits;
+    ctx->peak_nits      = c->peak_nits;
+    ctx->gamut_pct      = c->gamut_pct;
+    ctx->gamut_mode     = c->gamut_mode;
+    ctx->max_bpc        = c->max_bpc;
+    ctx->saturation_pct = c->saturation;
+    ctx->midtone_gamma  = c->midtone_gamma;
+    ctx->white_temp     = c->white_temp;
+    ctx->white_tint     = c->white_tint;
+    ctx->black_lift     = c->black_lift;
+    ctx->tonemap        = c->tonemap;
+    ctx->tonemap_knee   = c->tonemap_knee;
 }
 
 /* Write /etc/hdr-game.conf from KEY=VAL pairs passed on the command line. */
@@ -244,25 +301,87 @@ static drm_lut_entry *build_degamma_srgb(int n) {
 }
 
 /*
- * GAMMA: linear [0,1] → midtone curve → PQ code
+ * GAMMA: linear [0,1] → midtone curve → roll-off → black-lift → PQ code
  *   midtone_gamma: 100 = neutral, >100 = darken midtones (HDR punch),
  *                  <100 = lift midtones (looks washed out). Range 30–250.
- *   Applies Y^(gamma/100) in luminance before PQ encode.
+ *   black_lift:    0..100, raises the shadow floor (OLED black-crush fix).
+ *   tonemap:       0 = clip highlights linearly, 1 = soft BT.2390-style knee.
+ *   tonemap_knee:  0..100, where the highlight roll-off begins (% of range).
  */
-static drm_lut_entry *build_gamma_pq(int n, double sdr_nits, double midtone_gamma) {
+static drm_lut_entry *build_gamma_pq(int n, double sdr_nits, double midtone_gamma,
+                                     int black_lift, int tonemap, int tonemap_knee) {
     drm_lut_entry *lut = calloc(n, sizeof(*lut));
     if (!lut) return NULL;
     double scale = sdr_nits / 10000.0;
-    double g = midtone_gamma / 100.0;
+    double g     = midtone_gamma / 100.0;
+    /* shadow floor in linear: up to ~5% lift at black_lift=100 */
+    double floor = (black_lift > 0 ? black_lift : 0) / 2000.0;
+    double knee  = (tonemap ? tonemap_knee : 100) / 100.0;
+    if (knee < 0.0) knee = 0.0;
+    if (knee > 1.0) knee = 1.0;
     for (int i = 0; i < n; i++) {
         double x = (double)i / (n - 1);
         if (g != 1.0 && x > 0.0)
             x = pow(x, g);
-        double pq = linear_to_pq(x * scale);
+        /* soft highlight roll-off: ease-out compression above the knee */
+        if (tonemap && knee < 1.0 && x > knee) {
+            double t = (x - knee) / (1.0 - knee);   /* 0..1 */
+            x = knee + (1.0 - knee) * (1.0 - (1.0 - t) * (1.0 - t));
+        }
+        /* shadow floor lift, preserving headroom */
+        if (floor > 0.0)
+            x = floor + (1.0 - floor) * x;
+        double pq = linear_to_pq(clamp01(x) * scale);
         uint16_t v = (uint16_t)(clamp01(pq) * 65535.0 + 0.5);
         lut[i].r = lut[i].g = lut[i].b = v;
     }
     return lut;
+}
+
+/*
+ * White-balance RGB gains from correlated colour temperature + tint.
+ * Tanner Helland's blackbody approximation, normalised so the brightest
+ * channel = 1.0 (we trim, never boost, to avoid clipping). 6504K = D65 = neutral.
+ * tint shifts the green axis: negative = greener, positive = magenta.
+ */
+static void build_wb_gains(int temp_k, int tint, double gains[3]) {
+    double t = temp_k / 100.0;
+    double r, gg, b;
+    if (t <= 66.0) {
+        r = 255.0;
+    } else {
+        r = 329.698727446 * pow(t - 60.0, -0.1332047592);
+    }
+    if (t <= 66.0) {
+        gg = 99.4708025861 * log(t) - 161.1195681661;
+    } else {
+        gg = 288.1221695283 * pow(t - 60.0, -0.0755148492);
+    }
+    if (t >= 66.0) {
+        b = 255.0;
+    } else if (t <= 19.0) {
+        b = 0.0;
+    } else {
+        b = 138.5177312231 * log(t - 10.0) - 305.0447927307;
+    }
+    r  = clamp01(r  / 255.0);
+    gg = clamp01(gg / 255.0);
+    b  = clamp01(b  / 255.0);
+    /* tint: ±50 → ±10% green trim */
+    gg = clamp01(gg * (1.0 + (double)tint / 500.0));
+    /* normalise to the brightest channel so we only attenuate */
+    double mx = r > gg ? (r > b ? r : b) : (gg > b ? gg : b);
+    if (mx <= 0.0) mx = 1.0;
+    gains[0] = r  / mx;
+    gains[1] = gg / mx;
+    gains[2] = b  / mx;
+}
+
+/* Pre-multiply a CTM (row-major) by a diagonal RGB-gain matrix (applied to output). */
+static void apply_wb_to_ctm(const double gains[3], double m[3][3]) {
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            m[r][c] *= gains[r];
 }
 
 /* Identity LUT for reset */
@@ -360,7 +479,9 @@ static hdr_meta_t build_hdr_meta(int peak_nits, int sdr_nits) {
 
 /* ── NVIDIA legacy gamma fallback ────────────────────────────────────────── */
 static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits,
-                                double midtone_gamma, int reset) {
+                                double midtone_gamma, int black_lift, int tonemap,
+                                int tonemap_knee, int white_temp, int white_tint,
+                                int reset) {
     drmModeCrtcPtr crtc = drmModeGetCrtc(fd, crtc_id);
     if (!crtc) {
         fprintf(stderr, "NVIDIA gamma: crtc has no gamma table\n");
@@ -378,21 +499,36 @@ static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits,
     uint16_t *g = malloc(gs * sizeof(uint16_t));
     uint16_t *b = malloc(gs * sizeof(uint16_t));
     if (!r || !g || !b) { free(r); free(g); free(b); return -1; }
-    double gv = midtone_gamma / 100.0;
+    double gv    = midtone_gamma / 100.0;
+    double floor = (black_lift > 0 ? black_lift : 0) / 2000.0;
+    double knee  = (tonemap ? tonemap_knee : 100) / 100.0;
+    if (knee < 0.0) knee = 0.0;
+    if (knee > 1.0) knee = 1.0;
+    double gains[3] = {1.0, 1.0, 1.0};
+    if (!reset && (white_temp != DEFAULT_WHITE_TEMP || white_tint != 0))
+        build_wb_gains(white_temp, white_tint, gains);
 
     for (uint32_t i = 0; i < gs; i++) {
-        uint16_t v;
         if (reset) {
-            v = (uint16_t)((double)i / (gs - 1) * 65535.0 + 0.5);
-        } else {
-            double x      = (double)i / (gs - 1);
-            double linear = srgb_to_linear(x);
-            if (gv != 1.0 && linear > 0.0)
-                linear = pow(linear, gv);
-            double pq = linear_to_pq(linear * sdr_nits / 10000.0);
-            v = (uint16_t)(clamp01(pq) * 65535.0 + 0.5);
+            uint16_t v = (uint16_t)((double)i / (gs - 1) * 65535.0 + 0.5);
+            r[i] = g[i] = b[i] = v;
+            continue;
         }
-        r[i] = g[i] = b[i] = v;
+        double x      = (double)i / (gs - 1);
+        double linear = srgb_to_linear(x);
+        if (gv != 1.0 && linear > 0.0)
+            linear = pow(linear, gv);
+        if (tonemap && knee < 1.0 && linear > knee) {
+            double t = (linear - knee) / (1.0 - knee);
+            linear = knee + (1.0 - knee) * (1.0 - (1.0 - t) * (1.0 - t));
+        }
+        if (floor > 0.0)
+            linear = floor + (1.0 - floor) * linear;
+        double pq = linear_to_pq(clamp01(linear) * sdr_nits / 10000.0);
+        double base = clamp01(pq) * 65535.0;
+        r[i] = (uint16_t)(base * gains[0] + 0.5);
+        g[i] = (uint16_t)(base * gains[1] + 0.5);
+        b[i] = (uint16_t)(base * gains[2] + 0.5);
     }
 
     int ret = drmModeCrtcSetGamma(fd, crtc_id, gs, r, g, b);
@@ -469,6 +605,11 @@ static void usage(const char *argv0) {
         "  --gamut-mode MODE        bt2020 | dci-p3 | srgb (default: from EDID colorimetry)\n"
         "  --saturation N           Color intensity 50-200%% (100=neutral; default 100)\n"
         "  --midtone-gamma N        Midtone curve 30-250%% (100=neutral, >100=HDR punch; default 100)\n"
+        "  --white-temp K           White point in Kelvin (default 6504 = D65 neutral)\n"
+        "  --white-tint N           Green(-)/magenta(+) tint, -50..+50 (default 0)\n"
+        "  --black-lift N           Lift shadow floor 0-100 (OLED black-crush fix; default 0)\n"
+        "  --tonemap MODE           Highlight handling: clip | rolloff (default clip)\n"
+        "  --tonemap-knee N         Roll-off start 0-100%% of range (default 50)\n"
         "  --bpc N                  Output bit depth: 8, 10, or 12 (default 10)\n"
         "  --oled-dim-min N         OLED auto-dim timeout in minutes (0=disabled)\n"
         "  --dim-to N               Set SDR=N peak=N*4 and apply (OLED auto-dim use)\n"
@@ -514,6 +655,11 @@ static int do_apply(ApplyCtx *ctx) {
     int max_bpc       = ctx->max_bpc;
     int saturation_pct = ctx->saturation_pct;
     int midtone_gamma  = ctx->midtone_gamma;
+    int white_temp     = ctx->white_temp;
+    int white_tint     = ctx->white_tint;
+    int black_lift     = ctx->black_lift;
+    int tonemap        = ctx->tonemap;
+    int tonemap_knee   = ctx->tonemap_knee;
     int reset          = ctx->reset;
     int no_vt_switch   = ctx->no_vt_switch;
 
@@ -659,7 +805,8 @@ static int do_apply(ApplyCtx *ctx) {
         build_ctm_identity(ctm9);
     } else {
         deg_lut = build_degamma_srgb(LUT_SIZE);
-        gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits, (double)midtone_gamma);
+        gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits, (double)midtone_gamma,
+                                 black_lift, tonemap, tonemap_knee);
         double t = gamut_pct / 100.0;
         double gamut_mat[3][3];
         const double (*target)[3] = (gamut_mode == 1) ? CTM_709_TO_DCIP3 :
@@ -671,6 +818,12 @@ static int do_apply(ApplyCtx *ctx) {
         build_sat_mat(saturation_pct / 100.0, sat_mat);
         double combined[3][3];
         mat_mul_3x3(gamut_mat, sat_mat, combined);
+        /* white balance: trim output channels by CCT/tint-derived gains */
+        if (white_temp != DEFAULT_WHITE_TEMP || white_tint != 0) {
+            double gains[3];
+            build_wb_gains(white_temp, white_tint, gains);
+            apply_wb_to_ctm(gains, combined);
+        }
         build_ctm((const double(*)[3])combined, ctm9);
     }
 
@@ -706,7 +859,8 @@ static int do_apply(ApplyCtx *ctx) {
     int ret;
     if (is_nvidia) {
         ret = set_nvidia_gamma_pq(fd, crtc_id, (double)sdr_nits,
-                                  (double)midtone_gamma, reset);
+                                  (double)midtone_gamma, black_lift, tonemap,
+                                  tonemap_knee, white_temp, white_tint, reset);
         printf("NVIDIA legacy gamma (sRGB→midtone→PQ): ret=%d  errno=%d (%s)\n",
                ret, errno, ret ? strerror(errno) : "ok");
     } else {
@@ -951,16 +1105,10 @@ static void run_daemon(ApplyCtx *base_ctx) {
 
         if (triggered) {
             g_reload = 0;
-            int sn, pn, gp, gm, bpc, sat, odm, mtg, fo;
-            load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg, &fo);
+            KmsConf c;
+            load_conf(&c);
             ApplyCtx ctx = *base_ctx;
-            ctx.sdr_nits      = sn;
-            ctx.peak_nits     = pn;
-            ctx.gamut_pct     = gp;
-            ctx.gamut_mode    = gm;
-            ctx.max_bpc       = bpc;
-            ctx.saturation_pct = sat;
-            ctx.midtone_gamma  = mtg;
+            ctx_apply_conf(&ctx, &c);
             /* In daemon re-apply, trust saved conf values over EDID re-detection */
             ctx.explicit_peak       = 1;
             ctx.explicit_gamut_mode = 1;
@@ -995,31 +1143,15 @@ int main(int argc, char **argv) {
 
     ApplyCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.sdr_nits      = DEFAULT_SDR_NITS;
-    ctx.peak_nits     = DEFAULT_PEAK_NITS;
-    ctx.gamut_pct     = DEFAULT_GAMUT;
-    ctx.gamut_mode    = DEFAULT_GAMUT_MODE;
-    ctx.max_bpc       = DEFAULT_MAX_BPC;
-    ctx.saturation_pct = DEFAULT_SATURATION;
-    ctx.midtone_gamma  = DEFAULT_MIDTONE_GAMMA;
 
     int save = 0, save_only = 0, daemon_mode = 0;
-    int oled_dim_min = 0, force_oled = 0;
 
-    /* Load defaults from conf */
-    {
-        int sn, pn, gp, gm, bpc, sat, odm, mtg, fo;
-        load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg, &fo);
-        ctx.sdr_nits       = sn;
-        ctx.peak_nits      = pn;
-        ctx.gamut_pct      = gp;
-        ctx.gamut_mode     = gm;
-        ctx.max_bpc        = bpc;
-        ctx.saturation_pct = sat;
-        ctx.midtone_gamma  = mtg;
-        oled_dim_min = odm;
-        force_oled   = fo;
-    }
+    /* Load defaults from conf (falls back to built-in defaults if absent) */
+    KmsConf conf;
+    load_conf(&conf);
+    ctx_apply_conf(&ctx, &conf);
+    int oled_dim_min = conf.oled_dim_min;
+    int force_oled   = conf.force_oled;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "reset")            == 0) ctx.reset         = 1;
@@ -1041,6 +1173,14 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--bpc")           == 0 && i+1 < argc) ctx.max_bpc       = atoi(argv[++i]);
         else if (strcmp(argv[i], "--saturation")    == 0 && i+1 < argc) ctx.saturation_pct = atoi(argv[++i]);
         else if (strcmp(argv[i], "--midtone-gamma") == 0 && i+1 < argc) ctx.midtone_gamma  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--white-temp")    == 0 && i+1 < argc) ctx.white_temp     = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--white-tint")    == 0 && i+1 < argc) ctx.white_tint     = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--black-lift")    == 0 && i+1 < argc) ctx.black_lift     = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--tonemap")       == 0 && i+1 < argc) {
+            const char *m = argv[++i];
+            ctx.tonemap = (strcmp(m, "rolloff") == 0 || strcmp(m, "1") == 0) ? 1 : 0;
+        }
+        else if (strcmp(argv[i], "--tonemap-knee")  == 0 && i+1 < argc) ctx.tonemap_knee   = atoi(argv[++i]);
         else if (strcmp(argv[i], "--oled-dim-min")  == 0 && i+1 < argc) oled_dim_min       = atoi(argv[++i]);
         else if (strcmp(argv[i], "--force-oled")    == 0 && i+1 < argc) force_oled         = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gamut-mode")    == 0 && i+1 < argc) {
@@ -1063,9 +1203,18 @@ int main(int argc, char **argv) {
 
     if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
 
-    if ((save || save_only) && !ctx.reset)
-        save_conf(ctx.sdr_nits, ctx.peak_nits, ctx.gamut_pct, ctx.gamut_mode,
-                  ctx.max_bpc, ctx.saturation_pct, oled_dim_min, ctx.midtone_gamma, force_oled);
+    if ((save || save_only) && !ctx.reset) {
+        KmsConf out = {
+            .sdr_nits = ctx.sdr_nits, .peak_nits = ctx.peak_nits,
+            .gamut_pct = ctx.gamut_pct, .gamut_mode = ctx.gamut_mode,
+            .max_bpc = ctx.max_bpc, .saturation = ctx.saturation_pct,
+            .oled_dim_min = oled_dim_min, .midtone_gamma = ctx.midtone_gamma,
+            .force_oled = force_oled, .white_temp = ctx.white_temp,
+            .white_tint = ctx.white_tint, .black_lift = ctx.black_lift,
+            .tonemap = ctx.tonemap, .tonemap_knee = ctx.tonemap_knee,
+        };
+        save_conf(&out);
+    }
 
     if (save_only) return 0;
 
