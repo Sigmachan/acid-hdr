@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=HDR Display Settings
+Comment=HDR calibration — brightness, gamut, PQ pipeline
+Exec=cosmic-hdr-settings
+Icon=preferences-desktop-display
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+Keywords=HDR;display;color;calibration;brightness;BT2020;

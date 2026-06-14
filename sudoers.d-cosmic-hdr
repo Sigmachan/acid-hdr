@@ -1,0 +1,7 @@
+# cosmic-hdr — allow any user to run the HDR injector without password prompt
+# (binary is root-owned, actions are limited to DRM color properties)
+ALL ALL=(root) NOPASSWD: /usr/local/bin/cosmic-hdr
+ALL ALL=(root) NOPASSWD: /usr/bin/tee /etc/cosmic-hdr.conf
+ALL ALL=(root) NOPASSWD: /usr/bin/systemctl start cosmic-hdr.service
+ALL ALL=(root) NOPASSWD: /usr/bin/systemctl stop cosmic-hdr.service
+ALL ALL=(root) NOPASSWD: /usr/bin/systemctl restart cosmic-hdr.service

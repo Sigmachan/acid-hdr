@@ -1,16 +1,19 @@
 /*
  * cosmic-hdr.c  — HDR10 + BT.2020 color pipeline injector via KMS atomic
  *
- * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
- * Sets CTM (BT.709→BT.2020 gamut expansion) + HDR_OUTPUT_METADATA + Colorspace.
- * Properties persist after we release master (Smithay doesn't touch them).
+ * Mirrors KDE Plasma 6 HDR pipeline:
+ *   DEGAMMA (sRGB→linear) → CTM (BT.709→BT.2020) → GAMMA (linear→PQ/ST2084)
+ *   + HDR_OUTPUT_METADATA + Colorspace=BT2020_RGB on the connector
  *
- * Build:
- *   cc -O2 -o ~/.local/bin/cosmic-hdr $(pkg-config --cflags --libs libdrm) ~/.local/bin/cosmic-hdr.c -lm
+ * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
+ * Properties persist after master release (cosmic-comp doesn't reset them).
  *
  * Usage (must be root):
- *   sudo cosmic-hdr          apply
- *   sudo cosmic-hdr reset    restore linear + SDR
+ *   sudo cosmic-hdr                     apply (reads /etc/cosmic-hdr.conf)
+ *   sudo cosmic-hdr reset               restore SDR
+ *   sudo cosmic-hdr --sdr-nits 203      override SDR white brightness
+ *   sudo cosmic-hdr --peak-nits 800     override display peak
+ *   sudo cosmic-hdr --gamut 100         override gamut expansion 0-100%
  */
 
 #include <stdio.h>
@@ -29,21 +32,27 @@
 #include <drm_mode.h>
 
 /* ── config ──────────────────────────────────────────────────────────────── */
-#define DRM_DEV       "/dev/dri/card1"
-#define CONF_PATH     "/etc/cosmic-hdr.conf"
+#define DRM_DEV    "/dev/dri/card1"
+#define CONF_PATH  "/etc/cosmic-hdr.conf"
+#define LUT_SIZE   4096
 
-/* Defaults — overridden by /etc/cosmic-hdr.conf */
-#define DEFAULT_PEAK_NITS    400   /* see note below */
-#define DEFAULT_GAMUT        100   /* 0=identity  100=full BT.2020 expansion */
+/*
+ * SDR_NITS: brightness of SDR white in HDR mode (nits).
+ *   KDE default: 200. Standard reference: 203 (CTA-861-H).
+ *   Lower = dimmer desktop. Higher = brighter desktop.
+ *
+ * PEAK_NITS: display mastering peak — tells TV the max content brightness.
+ *   Set to your display's actual peak (A85H OLED ≈ 800-1000 nits).
+ *   This is now meaningful because we properly PQ-encode the signal.
+ *
+ * GAMUT: 0 = identity CTM, 100 = full BT.709→BT.2020 expansion.
+ */
+#define DEFAULT_SDR_NITS   203
+#define DEFAULT_PEAK_NITS  800
+#define DEFAULT_GAMUT      100
 
-/* MaxCLL declared to the TV. Controls tone-mapper aggression on desktop.
- * We're sending sRGB content labeled HDR10/PQ — the TV applies PQ decoding,
- * which reads sRGB mid-tones as very high luminance. Keep this LOW (~SDR
- * white range) so the TV doesn't boost. For games, Gamescope overrides this
- * with its own metadata automatically.
- * Default 400 = SDR-ish desktop, HDR mode active, good blacks, no blow-out. */
-
-static void load_conf(int *peak_nits, int *gamut_pct) {
+static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct) {
+    *sdr_nits  = DEFAULT_SDR_NITS;
     *peak_nits = DEFAULT_PEAK_NITS;
     *gamut_pct = DEFAULT_GAMUT;
     FILE *f = fopen(CONF_PATH, "r");
@@ -51,26 +60,82 @@ static void load_conf(int *peak_nits, int *gamut_pct) {
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int v;
+        if (sscanf(line, "SDR_NITS=%d",  &v) == 1) *sdr_nits  = v;
         if (sscanf(line, "PEAK_NITS=%d", &v) == 1) *peak_nits = v;
         if (sscanf(line, "GAMUT=%d",     &v) == 1) *gamut_pct = v;
     }
     fclose(f);
 }
 
+/* ── LUT helpers ─────────────────────────────────────────────────────────── */
+typedef struct { uint16_t r, g, b, pad; } drm_lut_entry;
+
+static double srgb_to_linear(double x) {
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+
+/* SMPTE ST2084 (PQ) encode: linear light [0,1] → PQ code [0,1]
+ * where linear 1.0 corresponds to 10000 cd/m². */
+static double linear_to_pq(double L) {
+    if (L <= 0.0) return 0.0;
+    const double m1 = 0.1593017578125;
+    const double m2 = 78.84375;
+    const double c1 = 0.8359375;
+    const double c2 = 18.8515625;
+    const double c3 = 18.6875;
+    double Lm = pow(L, m1);
+    return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
+}
+
+static double clamp01(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+
+/* DEGAMMA: sRGB gamma → linear [0,1] */
+static drm_lut_entry *build_degamma_srgb(int n) {
+    drm_lut_entry *lut = calloc(n, sizeof(*lut));
+    for (int i = 0; i < n; i++) {
+        double x = (double)i / (n - 1);
+        uint16_t v = (uint16_t)(clamp01(srgb_to_linear(x)) * 65535.0 + 0.5);
+        lut[i].r = lut[i].g = lut[i].b = v;
+    }
+    return lut;
+}
+
+/* GAMMA: linear [0,1] → PQ code, where linear 1.0 = sdr_nits cd/m².
+ * Matches KDE's approach: SDR white maps to sdr_nits on the PQ curve. */
+static drm_lut_entry *build_gamma_pq(int n, double sdr_nits) {
+    drm_lut_entry *lut = calloc(n, sizeof(*lut));
+    double scale = sdr_nits / 10000.0;  /* normalize to PQ range */
+    for (int i = 0; i < n; i++) {
+        double x = (double)i / (n - 1); /* linear light [0,1], 1=SDR white */
+        double pq = linear_to_pq(x * scale);
+        uint16_t v = (uint16_t)(clamp01(pq) * 65535.0 + 0.5);
+        lut[i].r = lut[i].g = lut[i].b = v;
+    }
+    return lut;
+}
+
+/* Identity LUT for reset */
+static drm_lut_entry *build_linear_lut(int n) {
+    drm_lut_entry *lut = calloc(n, sizeof(*lut));
+    for (int i = 0; i < n; i++) {
+        uint16_t v = (uint16_t)((double)i / (n - 1) * 65535.0 + 0.5);
+        lut[i].r = lut[i].g = lut[i].b = v;
+    }
+    return lut;
+}
+
+/* ── CTM ─────────────────────────────────────────────────────────────────── */
 /*
- * BT.709 → BT.2020 gamut expansion matrix.
- * Derived from: (BT.2020←XYZ) × (XYZ←BT.709), D65 whitepoint.
- * Correct colourimetric expansion — white stays white, no saturation pumping.
- * Required when Colorspace=BT2020_RGB so the TV decodes colours correctly.
+ * BT.709 → BT.2020 gamut expansion.
+ * Computed from standard primaries via (BT.2020←XYZ) × (XYZ←BT.709), D65.
+ * Applied in linear light domain (between DEGAMMA and GAMMA).
  */
 static const double CTM_709_TO_2020[3][3] = {
     { 0.627504,  0.329275,  0.043303 },
     { 0.069108,  0.919519,  0.011360 },
     { 0.016394,  0.088011,  0.895380 },
 };
-/* ─────────────────────────────────────────────────────────────────────────── */
 
-/* drm_color_ctm: 9 × S31.32 (bit63=sign, bits[62:0]=unsigned magnitude) */
 static void build_ctm(const double m[3][3], uint64_t out[9]) {
     for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
         double v = m[r][c];
@@ -86,17 +151,12 @@ static void build_ctm_identity(uint64_t out[9]) {
 }
 
 /* ── HDR10 metadata ──────────────────────────────────────────────────────── */
-/*
- * Mirrors struct hdr_output_metadata from <drm/drm_mode.h> exactly.
- * sizeof = 32:  u32(4) + u8(1) + u8(1) + [no pad, u16 is at offset 6] +
- *               u16[3][2](12) + u16[2](4) + u16*4(8) + trailing pad(2)
- * Must NOT be packed — the kernel validates blob size == 32.
- */
+/* Mirrors struct hdr_output_metadata from <drm/drm_mode.h>. sizeof == 32. */
 typedef struct {
-    uint32_t metadata_type;         /* 0 = HDMI_STATIC_METADATA_TYPE1    */
-    uint8_t  eotf;                  /* 2 = PQ/ST2084                     */
-    uint8_t  metadata_descriptor;   /* 0 = Static_Metadata_Descriptor_ID */
-    uint16_t display_primaries[3][2]; /* G,B,R  x,y × 50000              */
+    uint32_t metadata_type;
+    uint8_t  eotf;
+    uint8_t  metadata_descriptor;
+    uint16_t display_primaries[3][2];
     uint16_t white_point[2];
     uint16_t max_display_mastering_luminance;
     uint16_t min_display_mastering_luminance;
@@ -104,24 +164,24 @@ typedef struct {
     uint16_t max_frame_average_light_level;
 } hdr_meta_t;
 
-static hdr_meta_t build_hdr_meta(int peak_nits) {
+static hdr_meta_t build_hdr_meta(int peak_nits, int sdr_nits) {
     hdr_meta_t m = {0};
-    m.metadata_type = 0;  /* HDMI_STATIC_METADATA_TYPE1 */
-    m.eotf = 2;           /* PQ / ST2084 */
+    m.metadata_type      = 0;   /* HDMI_STATIC_METADATA_TYPE1 */
+    m.eotf               = 2;   /* PQ / ST2084 */
     m.metadata_descriptor = 0;
     /* BT.2020 primaries × 50000 (CTA-861 order: G, B, R) */
-    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000);  /* G x */
-    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000);  /* G y */
-    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000);  /* B x */
-    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000);  /* B y */
-    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000);  /* R x */
-    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000);  /* R y */
-    m.white_point[0] = (uint16_t)(0.3127 * 50000);          /* D65 */
+    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000); /* G x */
+    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000); /* G y */
+    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000); /* B x */
+    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000); /* B y */
+    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000); /* R x */
+    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000); /* R y */
+    m.white_point[0] = (uint16_t)(0.3127 * 50000);         /* D65 */
     m.white_point[1] = (uint16_t)(0.3290 * 50000);
     m.max_display_mastering_luminance = (uint16_t)peak_nits;
-    m.min_display_mastering_luminance = 1;                   /* 0.0001 cd/m² — OLED black */
+    m.min_display_mastering_luminance = 1;                  /* 0.0001 cd/m² OLED */
     m.max_content_light_level        = (uint16_t)peak_nits;
-    m.max_frame_average_light_level  = (uint16_t)(peak_nits / 2);
+    m.max_frame_average_light_level  = (uint16_t)sdr_nits;
     return m;
 }
 
@@ -133,8 +193,7 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
     for (uint32_t i = 0; i < props->count_props && !result; i++) {
         drmModePropertyPtr p = drmModeGetProperty(fd, props->props[i]);
         if (p) {
-            if (strcmp(p->name, name) == 0)
-                result = p->prop_id;
+            if (strcmp(p->name, name) == 0) result = p->prop_id;
             drmModeFreeProperty(p);
         }
     }
@@ -142,17 +201,13 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
     return result;
 }
 
-/* Find the integer value of a named enum option on a property. */
 static uint64_t get_enum_val(int fd, uint32_t prop_id, const char *enum_name) {
     drmModePropertyPtr p = drmModeGetProperty(fd, prop_id);
     if (!p) return 0;
-    uint64_t val = 0;
-    int found = 0;
+    uint64_t val = 0; int found = 0;
     for (int i = 0; i < p->count_enums; i++) {
         if (strcmp(p->enums[i].name, enum_name) == 0) {
-            val = (uint64_t)p->enums[i].value;
-            found = 1;
-            break;
+            val = (uint64_t)p->enums[i].value; found = 1; break;
         }
     }
     if (!found) {
@@ -171,36 +226,37 @@ static uint32_t mk_blob(int fd, const void *data, size_t sz) {
     return id;
 }
 
-/* ── VT switch helper ────────────────────────────────────────────────────── */
+/* ── VT switch ───────────────────────────────────────────────────────────── */
 static int vt_switch(int tty_fd, int target_vt) {
-    if (ioctl(tty_fd, VT_ACTIVATE, target_vt) < 0) { perror("VT_ACTIVATE"); return -1; }
+    if (ioctl(tty_fd, VT_ACTIVATE,  target_vt) < 0) { perror("VT_ACTIVATE");  return -1; }
     if (ioctl(tty_fd, VT_WAITACTIVE, target_vt) < 0) { perror("VT_WAITACTIVE"); return -1; }
     return 0;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    int reset = (argc >= 2 && strcmp(argv[1], "reset") == 0);
+    int reset = 0, sdr_nits, peak_nits, gamut_pct;
+    load_conf(&sdr_nits, &peak_nits, &gamut_pct);
 
-    int peak_nits, gamut_pct;
-    load_conf(&peak_nits, &gamut_pct);
-    printf("config: peak_nits=%d  gamut=%d%%\n", peak_nits, gamut_pct);
+    for (int i = 1; i < argc; i++) {
+        if      (strcmp(argv[i], "reset") == 0)         reset    = 1;
+        else if (strcmp(argv[i], "--sdr-nits")  == 0 && i+1 < argc) sdr_nits  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--peak-nits") == 0 && i+1 < argc) peak_nits = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gamut")     == 0 && i+1 < argc) gamut_pct = atoi(argv[++i]);
+    }
+    printf("config: sdr_nits=%d  peak_nits=%d  gamut=%d%%\n", sdr_nits, peak_nits, gamut_pct);
 
     if (geteuid() != 0) { fprintf(stderr, "run as root: sudo cosmic-hdr\n"); return 1; }
 
-    /* ── VT switch: move off TTY1 so COSMIC drops DRM master ──────────── */
     int tty_fd = open("/dev/tty1", O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (tty_fd < 0) { perror("open /dev/tty1"); return 1; }
 
     printf("switching to VT2 (screen will blank ~0.5s)...\n");
     if (vt_switch(tty_fd, 2) < 0) {
-        fprintf(stderr, "VT switch failed — try: sudo chvt 2 first\n");
-        close(tty_fd);
-        return 1;
+        fprintf(stderr, "VT switch failed\n"); close(tty_fd); return 1;
     }
-    usleep(400000); /* wait for cosmic-comp to call DROP_MASTER */
+    usleep(400000);
 
-    /* ── now we can take DRM master ───────────────────────────────────── */
     int fd = open(DRM_DEV, O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("open " DRM_DEV); vt_switch(tty_fd, 1); return 1; }
 
@@ -209,14 +265,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "drmSetClientCap: %s\n", strerror(errno));
         vt_switch(tty_fd, 1); return 1;
     }
-
     if (drmSetMaster(fd) != 0) {
-        fprintf(stderr, "drmSetMaster: %s — cosmic may not have released master\n", strerror(errno));
+        fprintf(stderr, "drmSetMaster: %s\n", strerror(errno));
         close(fd); vt_switch(tty_fd, 1); return 1;
     }
     printf("DRM master acquired\n");
 
-    /* Find HDMI-A connector and its CRTC */
     drmModeResPtr res = drmModeGetResources(fd);
     if (!res) { perror("drmModeGetResources"); drmDropMaster(fd); vt_switch(tty_fd, 1); return 1; }
 
@@ -241,11 +295,17 @@ int main(int argc, char **argv) {
     }
     printf("connector=%u  CRTC=%u\n", conn_id, crtc_id);
 
-    /* Blend CTM: 0% = identity, 100% = full BT.709→BT.2020 expansion */
+    /* ── Build LUTs and CTM ─────────────────────────────────────────────── */
+    drm_lut_entry *deg_lut, *gam_lut;
     uint64_t ctm9[9];
+
     if (reset) {
+        deg_lut = build_linear_lut(LUT_SIZE);
+        gam_lut = build_linear_lut(LUT_SIZE);
         build_ctm_identity(ctm9);
     } else {
+        deg_lut = build_degamma_srgb(LUT_SIZE);
+        gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits);
         double t = gamut_pct / 100.0;
         double blended[3][3];
         for (int r = 0; r < 3; r++)
@@ -254,67 +314,60 @@ int main(int argc, char **argv) {
         build_ctm((const double(*)[3])blended, ctm9);
     }
 
+    uint32_t deg_blob = mk_blob(fd, deg_lut, LUT_SIZE * sizeof(drm_lut_entry));
+    uint32_t gam_blob = mk_blob(fd, gam_lut, LUT_SIZE * sizeof(drm_lut_entry));
     uint32_t ctm_blob = mk_blob(fd, ctm9, sizeof(ctm9));
-    printf("CTM blob=%u\n", ctm_blob);
+    free(deg_lut); free(gam_lut);
+    printf("blobs: DEGAMMA=%u CTM=%u GAMMA=%u\n", deg_blob, ctm_blob, gam_blob);
 
-    uint32_t p_deg    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "DEGAMMA_LUT");
-    uint32_t p_ctm    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "CTM");
-    uint32_t p_gam    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "GAMMA_LUT");
-    uint32_t p_hdr    = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR,  "HDR_OUTPUT_METADATA");
-    uint32_t p_cspace = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR,  "Colorspace");
+    /* ── Get property IDs ───────────────────────────────────────────────── */
+    uint32_t p_deg    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "DEGAMMA_LUT");
+    uint32_t p_ctm    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "CTM");
+    uint32_t p_gam    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "GAMMA_LUT");
+    uint32_t p_hdr    = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "HDR_OUTPUT_METADATA");
+    uint32_t p_cspace = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "Colorspace");
     printf("props: DEGAMMA=%u CTM=%u GAMMA=%u HDR=%u Colorspace=%u\n",
            p_deg, p_ctm, p_gam, p_hdr, p_cspace);
 
-    /* ── CTM only — DEGAMMA/GAMMA disabled (blob=0) to avoid darkening ── */
+    /* ── Commit color pipeline ──────────────────────────────────────────── */
     drmModeAtomicReqPtr req = drmModeAtomicAlloc();
-    if (p_deg) drmModeAtomicAddProperty(req, crtc_id, p_deg, 0);          /* bypass */
+    if (p_deg) drmModeAtomicAddProperty(req, crtc_id, p_deg, reset ? 0 : deg_blob);
     if (p_ctm) drmModeAtomicAddProperty(req, crtc_id, p_ctm, reset ? 0 : ctm_blob);
-    if (p_gam) drmModeAtomicAddProperty(req, crtc_id, p_gam, 0);          /* bypass */
+    if (p_gam) drmModeAtomicAddProperty(req, crtc_id, p_gam, reset ? 0 : gam_blob);
 
     int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
-    printf("CTM commit ret=%d  errno=%d (%s)\n", ret, errno, ret ? strerror(errno) : "ok");
+    printf("color pipeline commit ret=%d  errno=%d (%s)\n", ret, errno, ret ? strerror(errno) : "ok");
     drmModeAtomicFree(req);
 
-    /* HDR + Colorspace: needs ALLOW_MODESET with full CRTC state */
+    /* ── Commit HDR metadata + colorspace (needs ALLOW_MODESET) ────────── */
     int hdr_ret = -1;
     if (p_hdr && p_cspace) {
-        uint64_t cspace_val = reset ? 0
-            : get_enum_val(fd, p_cspace, "BT2020_RGB");
+        uint64_t cspace_val = reset ? 0 : get_enum_val(fd, p_cspace, "BT2020_RGB");
 
-        hdr_meta_t hdr_m = build_hdr_meta(peak_nits);
-        uint32_t hdr_blob = (reset || cspace_val == 0) ? 0
-            : mk_blob(fd, &hdr_m, sizeof(hdr_m));
+        hdr_meta_t hdr_m    = build_hdr_meta(peak_nits, sdr_nits);
+        uint32_t hdr_blob   = (reset || cspace_val == 0) ? 0
+                              : mk_blob(fd, &hdr_m, sizeof(hdr_m));
 
-        printf("  Colorspace BT2020_RGB enum value = %llu\n", (unsigned long long)cspace_val);
+        uint32_t p_crtc_id  = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+        uint32_t p_crtc_act = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "ACTIVE");
+        uint32_t p_mode_id  = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "MODE_ID");
 
-        /* ALLOW_MODESET requires complete CRTC state in the commit */
-        uint32_t p_crtc_id    = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
-        uint32_t p_crtc_act   = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "ACTIVE");
-        uint32_t p_mode_id    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "MODE_ID");
-
-        /* Grab the current mode from the live CRTC */
-        drmModeCrtcPtr cur_crtc = drmModeGetCrtc(fd, crtc_id);
+        drmModeCrtcPtr cur = drmModeGetCrtc(fd, crtc_id);
         uint32_t mode_blob = 0;
-        if (cur_crtc && p_mode_id) {
-            drmModeCreatePropertyBlob(fd, &cur_crtc->mode,
-                                      sizeof(cur_crtc->mode), &mode_blob);
-            drmModeFreeCrtc(cur_crtc);
+        if (cur && p_mode_id) {
+            drmModeCreatePropertyBlob(fd, &cur->mode, sizeof(cur->mode), &mode_blob);
+            drmModeFreeCrtc(cur);
         }
-        printf("  modeset props: CRTC_ID=%u ACTIVE=%u MODE_ID=%u  mode_blob=%u\n",
-               p_crtc_id, p_crtc_act, p_mode_id, mode_blob);
 
         drmModeAtomicReqPtr req2 = drmModeAtomicAlloc();
-        /* connector: tie to CRTC + HDR + Colorspace */
         if (p_crtc_id)  drmModeAtomicAddProperty(req2, conn_id, p_crtc_id,  crtc_id);
         drmModeAtomicAddProperty(req2, conn_id, p_hdr,    hdr_blob);
         drmModeAtomicAddProperty(req2, conn_id, p_cspace, cspace_val);
-        /* CRTC: must be active with a valid mode */
         if (p_crtc_act) drmModeAtomicAddProperty(req2, crtc_id, p_crtc_act, 1);
         if (p_mode_id && mode_blob)
                         drmModeAtomicAddProperty(req2, crtc_id, p_mode_id,   mode_blob);
 
-        hdr_ret = drmModeAtomicCommit(fd, req2,
-            DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+        hdr_ret = drmModeAtomicCommit(fd, req2, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
         printf("HDR+Colorspace commit ret=%d  errno=%d (%s)\n",
                hdr_ret, errno, hdr_ret ? strerror(errno) : "ok");
         drmModeAtomicFree(req2);
@@ -322,9 +375,10 @@ int main(int argc, char **argv) {
         if (mode_blob) drmModeDestroyPropertyBlob(fd, mode_blob);
     }
 
-    /* ── release master and switch back ──────────────────────────────── */
     drmDropMaster(fd);
+    drmModeDestroyPropertyBlob(fd, deg_blob);
     drmModeDestroyPropertyBlob(fd, ctm_blob);
+    drmModeDestroyPropertyBlob(fd, gam_blob);
     close(fd);
 
     printf("DRM master released — switching back to VT1...\n");
@@ -333,12 +387,13 @@ int main(int argc, char **argv) {
 
     if (ret == 0 && hdr_ret == 0) {
         if (reset)
-            printf("✓ reset: linear gamma + SDR restored\n");
+            printf("✓ reset: SDR restored\n");
         else
-            printf("✓ HDR10 ACTIVE: CTM(BT.709→BT.2020) + BT2020_RGB + 10000nit metadata\n"
-                   "  TV should show HDR badge. Properties persist until reset.\n");
+            printf("✓ HDR10 ACTIVE: sRGB→linear→BT.2020→PQ pipeline live\n"
+                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%\n",
+                   sdr_nits, peak_nits, gamut_pct);
     } else {
-        printf("color LUT ret=%d  HDR ret=%d\n", ret, hdr_ret);
+        printf("pipeline ret=%d  HDR ret=%d\n", ret, hdr_ret);
     }
     return (ret != 0);
 }
