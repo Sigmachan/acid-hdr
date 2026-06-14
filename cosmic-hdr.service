@@ -1,17 +1,21 @@
 [Unit]
-Description=HDR10 color pipeline (BT.2020 + 10000-nit metadata)
+Description=HDR10 color pipeline (BT.2020 + PQ + metadata)
 Documentation=https://github.com/Sigmachan/cosmic-hdr
-# Wait for the display server to fully start and acquire DRM master.
-After=graphical.target
-Wants=graphical.target
+# Start after the display manager brings up a graphical session.
+# cosmic-hdr retries drmSetMaster internally (up to 6 s) so no sleep needed.
+After=display-manager.service
+Wants=display-manager.service
 
 [Service]
 Type=oneshot
-# 5-second grace period for the compositor to come up on TTY1.
-ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/cosmic-hdr
 ExecStop=/usr/local/bin/cosmic-hdr reset
 RemainAfterExit=yes
+# Retry if compositor is still initialising when the service fires
+Restart=on-failure
+RestartSec=3s
+StartLimitBurst=4
+StartLimitIntervalSec=30s
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
