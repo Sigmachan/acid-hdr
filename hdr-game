@@ -1,0 +1,37 @@
+#!/bin/bash
+# hdr-game — launch a Steam game (or any Vulkan app) inside Gamescope with HDR
+#
+# Steam launch option (paste into game properties → Launch Options):
+#   ENABLE_GAMESCOPE_WSI=1 DXVK_HDR=1 hdr-game %command%
+#
+# Manual use:
+#   hdr-game /path/to/game --game-args
+#   hdr-game -- /path/to/game --game-args
+#
+# Tuning: edit the variables below to match your display.
+
+GAMESCOPE_W=${GAMESCOPE_W:-3840}
+GAMESCOPE_H=${GAMESCOPE_H:-2160}
+GAMESCOPE_R=${GAMESCOPE_R:-120}
+
+# A85H OLED peak ≈ 800–1000 nits; 800 is the conservative safe value.
+HDR_ITM_TARGET=${HDR_ITM_TARGET:-800}
+
+# Standard SDR reference white (CTA-861-H: 203 nits).
+HDR_SDR_NITS=${HDR_SDR_NITS:-203}
+
+# Strip the leading '--' separator if Steam/shell adds one.
+[[ "$1" == "--" ]] && shift
+
+exec gamescope \
+    -W "$GAMESCOPE_W" -H "$GAMESCOPE_H" \
+    -r "$GAMESCOPE_R" \
+    -f \
+    --force-windows-fullscreen \
+    --hdr-enabled \
+    --hdr-itm-enabled \
+    --hdr-itm-target-nits "$HDR_ITM_TARGET" \
+    --hdr-sdr-content-nits "$HDR_SDR_NITS" \
+    --hdr-itm-sdr-nits    "$HDR_SDR_NITS" \
+    --backend wayland \
+    -- "$@"

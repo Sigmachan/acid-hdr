@@ -1,0 +1,17 @@
+[Unit]
+Description=HDR10 color pipeline (BT.2020 + 10000-nit metadata)
+Documentation=https://github.com/Sigmachan/acid-hdr
+# Wait for the display server to fully start and acquire DRM master.
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=oneshot
+# 5-second grace period for the compositor to come up on TTY1.
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/local/bin/acid-hdr
+ExecStop=/usr/local/bin/acid-hdr reset
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
