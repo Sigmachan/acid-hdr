@@ -2,27 +2,19 @@
  * kms-hdr (cosmic-hdr.c) — Universal KMS HDR injector for Linux
  * HDR10 + BT.2020/DCI-P3 color pipeline via DRM atomic, compositor-agnostic.
  *
+ * Modes:
+ *   one-shot (default):  apply and exit
+ *   daemon (--daemon):   apply, stay alive, re-apply on SIGUSR1
+ *   reload (--reload):   send SIGUSR1 to running daemon via /run/kms-hdr.pid
+ *
  * Two pipeline modes (auto-detected by GPU driver):
- *   AMD/Intel: DEGAMMA (sRGB→linear) → CTM (BT.709→gamut) → GAMMA (linear→PQ)
+ *   AMD/Intel: DEGAMMA (sRGB→linear) → CTM (BT.709→gamut×sat) → GAMMA (linear→midtone→PQ)
  *              + HDR_OUTPUT_METADATA + Colorspace=BT2020_RGB
  *   NVIDIA:    legacy gamma ramp (sRGB→PQ, no gamut expansion)
  *              + HDR_OUTPUT_METADATA + Colorspace=BT2020_RGB
  *
  * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
  * Properties persist after master release (any compositor).
- *
- * Usage (must be root / pkexec):
- *   kms-hdr                               apply (reads /etc/kms-hdr.conf)
- *   kms-hdr reset                         restore SDR
- *   kms-hdr --save --sdr-nits 203 ...    save to conf + apply
- *   kms-hdr --card /dev/dri/card1        override DRM device (auto-detected by default)
- *   kms-hdr --connector HDMI-A-2         override connector name
- *   kms-hdr --sdr-nits 203              set SDR white brightness (nits)
- *   kms-hdr --peak-nits 800             set display peak luminance (nits)
- *   kms-hdr --gamut 100                 gamut expansion blend 0-100%
- *   kms-hdr --gamut-mode [bt2020|dci-p3|srgb]
- *   kms-hdr --bpc [8|10|12]             request output bit depth
- *   kms-hdr --saturation [50-200]       colour saturation % (BT.709 matrix)
  */
 
 #include <stdio.h>
@@ -34,7 +26,10 @@
 #include <errno.h>
 #include <stdint.h>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/inotify.h>
 #include <linux/vt.h>
 
 #include <xf86drm.h>
@@ -42,52 +37,67 @@
 #include <drm_mode.h>
 
 /* ── config ──────────────────────────────────────────────────────────────── */
-#define CONF_PATH  "/etc/kms-hdr.conf"
-#define LUT_SIZE   4096
-#define MAX_CARDS  8
+#define CONF_PATH        "/etc/kms-hdr.conf"
+#define PID_FILE         "/run/kms-hdr.pid"
+#define LUT_SIZE         4096
+#define MAX_CARDS        8
 #define MASTER_RETRY_MS  500   /* ms between drmSetMaster retries */
 #define MASTER_RETRIES   12   /* total retries (~6 seconds) */
 
-/*
- * SDR_NITS: brightness of SDR white in HDR mode (nits).
- *   KDE default: 200. Standard reference: 203 (CTA-861-H).
- *   Lower = dimmer desktop. Higher = brighter desktop.
- *
- * PEAK_NITS: display mastering peak — tells TV the max content brightness.
- *   Set to your display's actual peak (A85H OLED ≈ 800-1000 nits).
- *   This is now meaningful because we properly PQ-encode the signal.
- *
- * GAMUT: 0 = identity CTM, 100 = full BT.709→BT.2020 expansion.
- */
-#define DEFAULT_SDR_NITS   203
-#define DEFAULT_PEAK_NITS  800
-#define DEFAULT_GAMUT      100
-#define DEFAULT_GAMUT_MODE  0   /* 0=BT.2020, 1=DCI-P3 */
-#define DEFAULT_MAX_BPC     10
-#define DEFAULT_SATURATION  100 /* 100 = neutral; 150 = vivid; 50 = desaturated */
+#define DEFAULT_SDR_NITS      203
+#define DEFAULT_PEAK_NITS     800
+#define DEFAULT_GAMUT         100
+#define DEFAULT_GAMUT_MODE    0    /* 0=BT.2020, 1=DCI-P3 */
+#define DEFAULT_MAX_BPC       10
+#define DEFAULT_SATURATION    100  /* 100 = neutral */
+#define DEFAULT_MIDTONE_GAMMA 100  /* 100 = neutral; >100 = HDR punch; <100 = lift */
 
+/* ── daemon signal state ──────────────────────────────────────────────────── */
+static volatile sig_atomic_t g_reload = 0;
+static void sigusr1_handler(int s) { (void)s; g_reload = 1; }
+
+/* ── apply context ────────────────────────────────────────────────────────── */
+typedef struct {
+    char card_path[64];   /* empty = auto-detect */
+    char conn_name[64];   /* empty = auto-detect */
+    int  reset;
+    int  no_vt_switch;
+    int  sdr_nits;
+    int  peak_nits;
+    int  gamut_pct;
+    int  gamut_mode;
+    int  max_bpc;
+    int  saturation_pct;
+    int  midtone_gamma;
+    int  explicit_peak;
+    int  explicit_gamut_mode;
+} ApplyCtx;
+
+/* ── conf I/O ────────────────────────────────────────────────────────────── */
 static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
                       int *gamut_mode, int *max_bpc, int *saturation,
-                      int *oled_dim_min) {
-    *sdr_nits     = DEFAULT_SDR_NITS;
-    *peak_nits    = DEFAULT_PEAK_NITS;
-    *gamut_pct    = DEFAULT_GAMUT;
-    *gamut_mode   = DEFAULT_GAMUT_MODE;
-    *max_bpc      = DEFAULT_MAX_BPC;
-    *saturation   = DEFAULT_SATURATION;
-    *oled_dim_min = 0;
+                      int *oled_dim_min, int *midtone_gamma) {
+    *sdr_nits      = DEFAULT_SDR_NITS;
+    *peak_nits     = DEFAULT_PEAK_NITS;
+    *gamut_pct     = DEFAULT_GAMUT;
+    *gamut_mode    = DEFAULT_GAMUT_MODE;
+    *max_bpc       = DEFAULT_MAX_BPC;
+    *saturation    = DEFAULT_SATURATION;
+    *oled_dim_min  = 0;
+    *midtone_gamma = DEFAULT_MIDTONE_GAMMA;
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int v; char s[64];
-        if (sscanf(line, "SDR_NITS=%d",     &v) == 1) *sdr_nits     = v;
-        if (sscanf(line, "PEAK_NITS=%d",    &v) == 1) *peak_nits    = v;
-        if (sscanf(line, "GAMUT=%d",        &v) == 1) *gamut_pct    = v;
-        if (sscanf(line, "MAX_BPC=%d",      &v) == 1) *max_bpc      = v;
-        if (sscanf(line, "SATURATION=%d",   &v) == 1) *saturation   = v;
-        if (sscanf(line, "OLED_DIM_MIN=%d", &v) == 1) *oled_dim_min = v;
-        if (sscanf(line, "GAMUT_MODE=%63s", s)  == 1)
+        if (sscanf(line, "SDR_NITS=%d",      &v) == 1) *sdr_nits      = v;
+        if (sscanf(line, "PEAK_NITS=%d",     &v) == 1) *peak_nits     = v;
+        if (sscanf(line, "GAMUT=%d",         &v) == 1) *gamut_pct     = v;
+        if (sscanf(line, "MAX_BPC=%d",       &v) == 1) *max_bpc       = v;
+        if (sscanf(line, "SATURATION=%d",    &v) == 1) *saturation    = v;
+        if (sscanf(line, "OLED_DIM_MIN=%d",  &v) == 1) *oled_dim_min  = v;
+        if (sscanf(line, "MIDTONE_GAMMA=%d", &v) == 1) *midtone_gamma = v;
+        if (sscanf(line, "GAMUT_MODE=%63s",   s) == 1)
             *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
     }
     fclose(f);
@@ -95,26 +105,24 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
 
 static void save_conf(int sdr_nits, int peak_nits, int gamut_pct,
                       int gamut_mode, int max_bpc, int saturation,
-                      int oled_dim_min) {
+                      int oled_dim_min, int midtone_gamma) {
     FILE *f = fopen(CONF_PATH, "w");
     if (!f) { perror("save_conf: fopen " CONF_PATH); return; }
     fprintf(f,
         "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\n"
-        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\n",
+        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\n",
         sdr_nits, peak_nits, gamut_pct, max_bpc,
         gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
-        saturation, oled_dim_min);
+        saturation, oled_dim_min, midtone_gamma);
     fclose(f);
     printf("saved: %s\n", CONF_PATH);
 }
 
-/* Write /etc/hdr-game.conf from KEY=VAL pairs passed on the command line.
- * Called when kms-hdr receives --save-game as first argument. */
+/* Write /etc/hdr-game.conf from KEY=VAL pairs passed on the command line. */
 static int save_game_conf(int argc, char **argv) {
-    /* argv[0] == "--save-game", followed by KEY=VAL tokens */
     const char *game_conf = "/etc/hdr-game.conf";
     FILE *f = fopen(game_conf, "w");
-    if (!f) { perror("save_game_conf: fopen " "/etc/hdr-game.conf"); return 1; }
+    if (!f) { perror("save_game_conf: fopen /etc/hdr-game.conf"); return 1; }
     for (int i = 1; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         if (!eq) { fprintf(stderr, "save-game: expected KEY=VAL, got: %s\n", argv[i]); continue; }
@@ -126,22 +134,24 @@ static int save_game_conf(int argc, char **argv) {
 }
 
 /* Auto-detect the DRM card device and connector name.
- * Enumerates /sys/class/drm/cardN-* entries; picks the first connector
- * with a non-empty EDID (= connected display).
- * card_out: "/dev/dri/cardN" · conn_out: "HDMI-A-2" (connector name without cardN-) */
+ * card_out: "/dev/dri/cardN" · conn_out: "HDMI-A-2" */
 static int find_drm_device(char *card_out, size_t card_sz,
                             char *conn_out, size_t conn_sz) {
     DIR *d = opendir("/sys/class/drm");
     if (!d) return -1;
-
     struct dirent *e;
     while ((e = readdir(d))) {
-        /* Match "cardN-TYPE-M" — skip bare "cardN" and non-card entries */
         if (strncmp(e->d_name, "card", 4) != 0) continue;
         char *dash = strchr(e->d_name + 4, '-');
         if (!dash) continue;
 
-        /* Read EDID to confirm display is connected */
+        /* Skip virtual/headless connectors (X11 backend, winit-in-X, Wayland backend) */
+        const char *conn_part = dash + 1;
+        if (strncmp(conn_part, "X11-",      4) == 0 ||
+            strncmp(conn_part, "Virtual-",  8) == 0 ||
+            strncmp(conn_part, "HEADLESS-", 9) == 0 ||
+            strncmp(conn_part, "WL-",       3) == 0) continue;
+
         char edid_path[512];
         snprintf(edid_path, sizeof(edid_path), "/sys/class/drm/%s/edid", e->d_name);
         int efd = open(edid_path, O_RDONLY);
@@ -149,10 +159,9 @@ static int find_drm_device(char *card_out, size_t card_sz,
         char buf[1]; int n = read(efd, buf, 1); close(efd);
         if (n <= 0) continue;
 
-        /* Found a connected display */
         int card_num = atoi(e->d_name + 4);
         snprintf(card_out, card_sz, "/dev/dri/card%d", card_num);
-        snprintf(conn_out, conn_sz, "%s", dash + 1);   /* e.g. "HDMI-A-2" */
+        snprintf(conn_out, conn_sz, "%s", conn_part);
         closedir(d);
         return 0;
     }
@@ -161,13 +170,6 @@ static int find_drm_device(char *card_out, size_t card_sz,
 }
 
 /* ── EDID auto-configuration ─────────────────────────────────────────────── */
-/*
- * Reads the EDID from sysfs and extracts:
- *   - HDR peak luminance (CTA-861 HDR Static Metadata ext_tag=6, max_luminance byte)
- *   - BT.2020 support   (CTA-861 Colorimetry ext_tag=5, bit 7)
- *   - DCI-P3 support    (CTA-861 Colorimetry ext_tag=5, bit 1)
- * Used to fill in optimal defaults when no explicit CLI flags are given.
- */
 static int parse_edid_caps(const char *path,
                             int *peak_nits, int *bt2020, int *dcip3) {
     *peak_nits = 0; *bt2020 = 0; *dcip3 = 0;
@@ -188,9 +190,9 @@ static int parse_edid_caps(const char *path,
             if (tag == 7 && len > 1) {
                 const uint8_t *p = d + 1;
                 size_t plen = len - 1;
-                if (d[0] == 6 && plen > 2 && p[2] != 0)    /* HDR Static Metadata */
+                if (d[0] == 6 && plen > 2 && p[2] != 0)
                     *peak_nits = (int)(50.0 * pow(2.0, p[2] / 32.0));
-                else if (d[0] == 5 && plen > 0) {           /* Colorimetry */
+                else if (d[0] == 5 && plen > 0) {
                     *bt2020 = (p[0] & 0x80) ? 1 : 0;
                     *dcip3  = (p[0] & 0x02) ? 1 : 0;
                 }
@@ -208,8 +210,6 @@ static double srgb_to_linear(double x) {
     return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
 }
 
-/* SMPTE ST2084 (PQ) encode: linear light [0,1] → PQ code [0,1]
- * where linear 1.0 corresponds to 10000 cd/m². */
 static double linear_to_pq(double L) {
     if (L <= 0.0) return 0.0;
     const double m1 = 0.1593017578125;
@@ -234,13 +234,20 @@ static drm_lut_entry *build_degamma_srgb(int n) {
     return lut;
 }
 
-/* GAMMA: linear [0,1] → PQ code, where linear 1.0 = sdr_nits cd/m².
- * Matches KDE's approach: SDR white maps to sdr_nits on the PQ curve. */
-static drm_lut_entry *build_gamma_pq(int n, double sdr_nits) {
+/*
+ * GAMMA: linear [0,1] → midtone curve → PQ code
+ *   midtone_gamma: 100 = neutral, >100 = darken midtones (HDR punch),
+ *                  <100 = lift midtones (looks washed out). Range 30–250.
+ *   Applies Y^(gamma/100) in luminance before PQ encode.
+ */
+static drm_lut_entry *build_gamma_pq(int n, double sdr_nits, double midtone_gamma) {
     drm_lut_entry *lut = calloc(n, sizeof(*lut));
-    double scale = sdr_nits / 10000.0;  /* normalize to PQ range */
+    double scale = sdr_nits / 10000.0;
+    double g = midtone_gamma / 100.0;
     for (int i = 0; i < n; i++) {
-        double x = (double)i / (n - 1); /* linear light [0,1], 1=SDR white */
+        double x = (double)i / (n - 1);
+        if (g != 1.0 && x > 0.0)
+            x = pow(x, g);
         double pq = linear_to_pq(x * scale);
         uint16_t v = (uint16_t)(clamp01(pq) * 65535.0 + 0.5);
         lut[i].r = lut[i].g = lut[i].b = v;
@@ -259,22 +266,12 @@ static drm_lut_entry *build_linear_lut(int n) {
 }
 
 /* ── CTM ─────────────────────────────────────────────────────────────────── */
-/*
- * BT.709 → BT.2020 gamut expansion.
- * Derived from (BT.2020←XYZ) × (XYZ←BT.709), D65 white point.
- * Applied in linear light domain (between DEGAMMA and GAMMA).
- */
 static const double CTM_709_TO_2020[3][3] = {
     { 0.627504,  0.329275,  0.043303 },
     { 0.069108,  0.919519,  0.011360 },
     { 0.016394,  0.088011,  0.895380 },
 };
 
-/*
- * BT.709 → DCI-P3 D65 gamut expansion.
- * Derived from (P3-D65←XYZ) × (XYZ←BT.709), D65 white point.
- * P3 is a middle ground: wider than sRGB, not as wide as BT.2020.
- */
 static const double CTM_709_TO_DCIP3[3][3] = {
     { 0.822461,  0.177538,  0.000000 },
     { 0.033195,  0.966805,  0.000000 },
@@ -295,7 +292,6 @@ static void build_ctm_identity(uint64_t out[9]) {
     build_ctm(id, out);
 }
 
-/* BT.709 saturation matrix. s=1.0 → identity; s>1 → vivid; s<1 → desaturated. */
 static void build_sat_mat(double s, double out[3][3]) {
     double Ry = 0.2126, Gy = 0.7152, By = 0.0722;
     out[0][0] = (1-s)*Ry + s; out[0][1] = (1-s)*Gy;      out[0][2] = (1-s)*By;
@@ -303,7 +299,6 @@ static void build_sat_mat(double s, double out[3][3]) {
     out[2][0] = (1-s)*Ry;     out[2][1] = (1-s)*Gy;      out[2][2] = (1-s)*By + s;
 }
 
-/* out = a × b  (3×3 matrix multiply) */
 static void mat_mul_3x3(const double a[3][3], const double b[3][3], double out[3][3]) {
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) {
@@ -313,7 +308,6 @@ static void mat_mul_3x3(const double a[3][3], const double b[3][3], double out[3
 }
 
 /* ── HDR10 metadata ──────────────────────────────────────────────────────── */
-/* Mirrors struct hdr_output_metadata from <drm/drm_mode.h>. sizeof == 32. */
 typedef struct {
     uint32_t metadata_type;
     uint8_t  eotf;
@@ -328,36 +322,27 @@ typedef struct {
 
 static hdr_meta_t build_hdr_meta(int peak_nits, int sdr_nits) {
     hdr_meta_t m = {0};
-    m.metadata_type      = 0;   /* HDMI_STATIC_METADATA_TYPE1 */
+    m.metadata_type      = 0;
     m.eotf               = 2;   /* PQ / ST2084 */
     m.metadata_descriptor = 0;
-    /* BT.2020 primaries × 50000 (CTA-861 order: G, B, R) */
-    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000); /* G x */
-    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000); /* G y */
-    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000); /* B x */
-    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000); /* B y */
-    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000); /* R x */
-    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000); /* R y */
-    m.white_point[0] = (uint16_t)(0.3127 * 50000);         /* D65 */
+    m.display_primaries[0][0] = (uint16_t)(0.170 * 50000);
+    m.display_primaries[0][1] = (uint16_t)(0.797 * 50000);
+    m.display_primaries[1][0] = (uint16_t)(0.131 * 50000);
+    m.display_primaries[1][1] = (uint16_t)(0.046 * 50000);
+    m.display_primaries[2][0] = (uint16_t)(0.708 * 50000);
+    m.display_primaries[2][1] = (uint16_t)(0.292 * 50000);
+    m.white_point[0] = (uint16_t)(0.3127 * 50000);
     m.white_point[1] = (uint16_t)(0.3290 * 50000);
     m.max_display_mastering_luminance = (uint16_t)peak_nits;
-    m.min_display_mastering_luminance = 1;                  /* 0.0001 cd/m² OLED */
+    m.min_display_mastering_luminance = 1;
     m.max_content_light_level        = (uint16_t)peak_nits;
     m.max_frame_average_light_level  = (uint16_t)sdr_nits;
     return m;
 }
 
 /* ── NVIDIA legacy gamma fallback ────────────────────────────────────────── */
-/*
- * NVIDIA nvidia-drm does not expose DEGAMMA_LUT/CTM/GAMMA_LUT atomic properties.
- * However it does support the legacy DRM_IOCTL_MODE_SETGAMMA call — the same
- * path KWin Plasma 6 uses for NVIDIA HDR.
- *
- * Result: PQ tonemapping (sRGB white → correct PQ nit target) WITHOUT gamut
- * expansion (no CTM = sRGB only). HDR signal still reaches the display via
- * HDR_OUTPUT_METADATA + Colorspace on the connector.
- */
-static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits, int reset) {
+static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits,
+                                double midtone_gamma, int reset) {
     drmModeCrtcPtr crtc = drmModeGetCrtc(fd, crtc_id);
     if (!crtc || crtc->gamma_size == 0) {
         if (crtc) drmModeFreeCrtc(crtc);
@@ -370,6 +355,7 @@ static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits, int re
     uint16_t *r = malloc(gs * sizeof(uint16_t));
     uint16_t *g = malloc(gs * sizeof(uint16_t));
     uint16_t *b = malloc(gs * sizeof(uint16_t));
+    double gv = midtone_gamma / 100.0;
 
     for (uint32_t i = 0; i < gs; i++) {
         uint16_t v;
@@ -378,7 +364,9 @@ static int set_nvidia_gamma_pq(int fd, uint32_t crtc_id, double sdr_nits, int re
         } else {
             double x      = (double)i / (gs - 1);
             double linear = srgb_to_linear(x);
-            double pq     = linear_to_pq(linear * sdr_nits / 10000.0);
+            if (gv != 1.0 && linear > 0.0)
+                linear = pow(linear, gv);
+            double pq = linear_to_pq(linear * sdr_nits / 10000.0);
             v = (uint16_t)(clamp01(pq) * 65535.0 + 0.5);
         }
         r[i] = g[i] = b[i] = v;
@@ -432,15 +420,17 @@ static uint32_t mk_blob(int fd, const void *data, size_t sz) {
 
 /* ── VT switch ───────────────────────────────────────────────────────────── */
 static int vt_switch(int tty_fd, int target_vt) {
-    if (ioctl(tty_fd, VT_ACTIVATE,  target_vt) < 0) { perror("VT_ACTIVATE");  return -1; }
+    if (ioctl(tty_fd, VT_ACTIVATE,   target_vt) < 0) { perror("VT_ACTIVATE");  return -1; }
     if (ioctl(tty_fd, VT_WAITACTIVE, target_vt) < 0) { perror("VT_WAITACTIVE"); return -1; }
     return 0;
 }
 
+/* ── usage ───────────────────────────────────────────────────────────────── */
 static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [OPTIONS] [reset]\n"
         "       %s --save-game KEY=VAL ...\n"
+        "       %s --reload\n"
         "\n"
         "Options:\n"
         "  --card /dev/dri/cardN    DRM device (alias: --output; auto-detected)\n"
@@ -451,102 +441,57 @@ static void usage(const char *argv0) {
         "  --peak-nits N            Display peak luminance in nits (default: EDID or 800)\n"
         "  --gamut N                Gamut expansion blend 0-100%% (default 100)\n"
         "  --gamut-mode MODE        bt2020 | dci-p3 | srgb (default: from EDID colorimetry)\n"
-        "  --saturation N           Color intensity 50-200%% (100=neutral, 150=vivid; default 100)\n"
+        "  --saturation N           Color intensity 50-200%% (100=neutral; default 100)\n"
+        "  --midtone-gamma N        Midtone curve 30-250%% (100=neutral, >100=HDR punch; default 100)\n"
         "  --bpc N                  Output bit depth: 8, 10, or 12 (default 10)\n"
-        "  --oled-dim-min N         OLED auto-dim timeout in minutes (0=disabled, saved to conf)\n"
-        "  --dim-to N               Set SDR=N peak=N*4 and apply (used by OLED auto-dim service)\n"
-        "  --no-vt-switch           Skip VT2 switch — try direct DRM master (headless / boot use)\n"
+        "  --oled-dim-min N         OLED auto-dim timeout in minutes (0=disabled)\n"
+        "  --dim-to N               Set SDR=N peak=N*4 and apply (OLED auto-dim use)\n"
+        "  --no-vt-switch           Skip VT2 switch — try direct DRM master\n"
+        "  --daemon                 Apply and stay alive; re-apply on SIGUSR1\n"
+        "  --reload                 Send SIGUSR1 to running daemon via " PID_FILE "\n"
         "  reset                    Restore SDR (identity pipeline)\n"
         "  --save-game KEY=VAL ...  Write /etc/hdr-game.conf from KEY=VAL pairs and exit\n"
         "  --help                   Show this message\n"
         "\n"
-        "Defaults are auto-configured from EDID (peak nits, gamut) when not set.\n"
-        "GPU driver is auto-detected: AMD/Intel = full pipeline; NVIDIA = PQ gamma only.\n"
-        "HDMI-CEC: if /dev/cec0 is present, announces active source after HDR enable.\n",
-        argv0, argv0);
+        "Midtone gamma: 100=neutral, 130-160=HDR punch (darkens midtones),\n"
+        "               <100=lift midtones (looks washed out). Range 30-250.\n"
+        "GPU driver is auto-detected: AMD/Intel = full pipeline; NVIDIA = PQ gamma only.\n",
+        argv0, argv0, argv0);
 }
 
-/* ── main ────────────────────────────────────────────────────────────────── */
-int main(int argc, char **argv) {
-    /* --save-game dispatched before any other processing */
-    if (argc >= 2 && strcmp(argv[1], "--save-game") == 0) {
-        if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
-        return save_game_conf(argc - 1, argv + 1);
-    }
+/* ── do_apply ────────────────────────────────────────────────────────────── */
+/* All DRM work extracted here so both one-shot and daemon can call it. */
+static int do_apply(ApplyCtx *ctx) {
+    char card_path[64];
+    char conn_buf[64];
+    const char *want_conn = NULL;
 
-    int reset = 0, save = 0, save_only = 0;
-    int sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct, oled_dim_min;
-    int no_vt_switch = 0;
-    int explicit_peak = 0, explicit_gamut_mode = 0;
-    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc,
-              &saturation_pct, &oled_dim_min);
-
-    char card_path[64] = {0};
-    char conn_override[64] = {0};
-
-    for (int i = 1; i < argc; i++) {
-        if      (strcmp(argv[i], "reset")            == 0) reset          = 1;
-        else if (strcmp(argv[i], "--help")            == 0 ||
-                 strcmp(argv[i], "-h")                == 0) { usage(argv[0]); return 0; }
-        else if (strcmp(argv[i], "--save")            == 0) save           = 1;
-        else if (strcmp(argv[i], "--no-vt-switch")    == 0) no_vt_switch   = 1;
-        else if ((strcmp(argv[i], "--card")       == 0 ||
-                  strcmp(argv[i], "--output")     == 0) && i+1 < argc)
-            snprintf(card_path, sizeof(card_path), "%s", argv[++i]);
-        else if ((strcmp(argv[i], "--connector")  == 0 ||
-                  strcmp(argv[i], "--display")    == 0) && i+1 < argc)
-            snprintf(conn_override, sizeof(conn_override), "%s", argv[++i]);
-        else if (strcmp(argv[i], "--sdr-nits")   == 0 && i+1 < argc) sdr_nits  = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--peak-nits")  == 0 && i+1 < argc)
-            { peak_nits = atoi(argv[++i]); explicit_peak = 1; }
-        else if (strcmp(argv[i], "--gamut")      == 0 && i+1 < argc) gamut_pct = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--bpc")        == 0 && i+1 < argc) max_bpc   = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--gamut-mode") == 0 && i+1 < argc) {
-            const char *m = argv[++i];
-            gamut_mode = strcmp(m, "dci-p3") == 0 ? 1 :
-                         strcmp(m, "srgb")   == 0 ? 2 : 0;
-            explicit_gamut_mode = 1;
-        }
-        else if (strcmp(argv[i], "--saturation")   == 0 && i+1 < argc) saturation_pct = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--oled-dim-min") == 0 && i+1 < argc) oled_dim_min   = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--save-only")    == 0) save_only = 1;
-        else if (strcmp(argv[i], "--dim-to")       == 0 && i+1 < argc) {
-            /* OLED auto-dim: set both nit values to a low level and apply */
-            int n = atoi(argv[++i]);
-            sdr_nits  = n;
-            peak_nits = n * 4;
-            explicit_peak = 1;
-        }
-        /* accepted for forward-compat with panel passthrough */
-        else if (strcmp(argv[i], "--oled-preset")  == 0 && i+1 < argc) { ++i; }
-        else { fprintf(stderr, "unknown arg: %s  (try --help)\n", argv[i]); return 1; }
-    }
-
-    if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
-
-    /* Save config before applying if requested */
-    if (save && !reset)
-        save_conf(sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc,
-                  saturation_pct, oled_dim_min);
-
-    if (save_only) return 0;
-
-    /* Auto-detect DRM device if not specified */
-    char auto_conn[64] = {0};
-    if (card_path[0] == '\0') {
+    /* Auto-detect card/connector if not provided */
+    if (ctx->card_path[0] != '\0') {
+        snprintf(card_path, sizeof(card_path), "%s", ctx->card_path);
+        want_conn = ctx->conn_name[0] ? ctx->conn_name : NULL;
+    } else {
         if (find_drm_device(card_path, sizeof(card_path),
-                            auto_conn, sizeof(auto_conn)) != 0) {
+                            conn_buf, sizeof(conn_buf)) != 0) {
             fprintf(stderr, "no connected display found in /sys/class/drm — "
                             "use --card and --connector\n");
             return 1;
         }
-        printf("auto-detected: %s  connector: %s\n", card_path, auto_conn);
+        printf("auto-detected: %s  connector: %s\n", card_path, conn_buf);
+        want_conn = ctx->conn_name[0] ? ctx->conn_name : conn_buf;
     }
-    /* conn_override takes priority; auto_conn is the fallback */
-    const char *want_conn = conn_override[0] ? conn_override :
-                            auto_conn[0]      ? auto_conn    : NULL;
 
-    /* ── EDID auto-configuration ──────────────────────────────────────────── */
+    int sdr_nits      = ctx->sdr_nits;
+    int peak_nits     = ctx->peak_nits;
+    int gamut_pct     = ctx->gamut_pct;
+    int gamut_mode    = ctx->gamut_mode;
+    int max_bpc       = ctx->max_bpc;
+    int saturation_pct = ctx->saturation_pct;
+    int midtone_gamma  = ctx->midtone_gamma;
+    int reset          = ctx->reset;
+    int no_vt_switch   = ctx->no_vt_switch;
+
+    /* EDID auto-configuration */
     if (!reset && want_conn) {
         char sysfs_edid[512];
         const char *cname = strrchr(card_path, '/');
@@ -558,14 +503,14 @@ int main(int argc, char **argv) {
         if (parse_edid_caps(sysfs_edid, &edid_peak, &edid_bt2020, &edid_dcip3) == 0) {
             printf("EDID auto-detect: peak=%d nits  BT.2020=%s  DCI-P3=%s\n",
                    edid_peak, edid_bt2020 ? "✓" : "—", edid_dcip3 ? "✓" : "—");
-            if (!explicit_peak && edid_peak > 0) {
+            if (!ctx->explicit_peak && edid_peak > 0) {
                 peak_nits = edid_peak;
                 printf("  → peak-nits set to %d (from EDID)\n", peak_nits);
             }
-            if (!explicit_gamut_mode) {
-                if (edid_bt2020)       { gamut_mode = 0; printf("  → gamut-mode: BT.2020 (from EDID)\n"); }
-                else if (edid_dcip3)   { gamut_mode = 1; printf("  → gamut-mode: DCI-P3 (from EDID)\n"); }
-                else                   { gamut_mode = 2; printf("  → gamut-mode: sRGB (display lacks wide gamut)\n"); }
+            if (!ctx->explicit_gamut_mode) {
+                if (edid_bt2020)     { gamut_mode = 0; printf("  → gamut-mode: BT.2020 (from EDID)\n"); }
+                else if (edid_dcip3) { gamut_mode = 1; printf("  → gamut-mode: DCI-P3 (from EDID)\n"); }
+                else                 { gamut_mode = 2; printf("  → gamut-mode: sRGB (display lacks wide gamut)\n"); }
             }
         }
     }
@@ -573,9 +518,11 @@ int main(int argc, char **argv) {
     const char *gmode_str = gamut_mode == 1 ? "DCI-P3" :
                             gamut_mode == 2 ? "sRGB"   : "BT.2020";
     printf("card: %s  connector: %s\n"
-           "config: sdr_nits=%d  peak_nits=%d  gamut=%d%%  mode=%s  bpc=%d  saturation=%d%%\n",
+           "config: sdr_nits=%d  peak_nits=%d  gamut=%d%%  mode=%s  "
+           "bpc=%d  saturation=%d%%  midtone_gamma=%d%%\n",
            card_path, want_conn ? want_conn : "any",
-           sdr_nits, peak_nits, gamut_pct, gmode_str, max_bpc, saturation_pct);
+           sdr_nits, peak_nits, gamut_pct, gmode_str,
+           max_bpc, saturation_pct, midtone_gamma);
 
     int tty_fd = -1;
     if (!no_vt_switch) {
@@ -597,14 +544,12 @@ int main(int argc, char **argv) {
         printf("no-vt-switch mode: attempting direct DRM master acquisition\n");
     }
 
-    int fd = open(card_path, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        perror(card_path);
-        if (tty_fd >= 0) { vt_switch(tty_fd, 1); close(tty_fd); }
-        return 1;
-    }
+#define VT_CLEANUP()  do { if (tty_fd >= 0) { vt_switch(tty_fd, 1); close(tty_fd); } } while(0)
 
-    /* ── Detect GPU driver ──────────────────────────────────────────────── */
+    int fd = open(card_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) { perror(card_path); VT_CLEANUP(); return 1; }
+
+    /* Detect GPU driver */
     drmVersionPtr drv = drmGetVersion(fd);
     int is_nvidia = drv && strstr(drv->name, "nvidia") != NULL;
     printf("GPU driver: %s  (pipeline mode: %s)\n",
@@ -615,18 +560,15 @@ int main(int argc, char **argv) {
 
     if (is_nvidia && !reset) {
         printf("NVIDIA: DEGAMMA_LUT/CTM/GAMMA_LUT not exposed by nvidia-drm.\n"
-               "  HDR10 signal will be sent; no software tonemapping/gamut expansion.\n"
-               "  SDR desktop may appear washed — use Gamescope/mpv for HDR content.\n");
+               "  HDR10 signal will be sent; no software tonemapping/gamut expansion.\n");
     }
-
-#define VT_CLEANUP()  do { if (tty_fd >= 0) { vt_switch(tty_fd, 1); close(tty_fd); } } while(0)
 
     if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) ||
         drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
         fprintf(stderr, "drmSetClientCap: %s\n", strerror(errno));
-        VT_CLEANUP(); return 1;
+        close(fd); VT_CLEANUP(); return 1;
     }
-    /* Retry loop — compositor may take a moment to release on VT switch */
+
     int master_ok = 0;
     for (int r = 0; r < MASTER_RETRIES; r++) {
         if (drmSetMaster(fd) == 0) { master_ok = 1; break; }
@@ -643,7 +585,6 @@ int main(int argc, char **argv) {
     drmModeResPtr res = drmModeGetResources(fd);
     if (!res) { perror("drmModeGetResources"); drmDropMaster(fd); VT_CLEANUP(); return 1; }
 
-    /* Find connector and CRTC — match by name if want_conn given, else first connected */
     static const char *conn_type_names[] = {
         "Unknown","VGA","DVII","DVID","DVIA","Composite","SVIDEO",
         "LVDS","Component","9PinDIN","DisplayPort","HDMI-A","HDMI-B",
@@ -655,7 +596,6 @@ int main(int argc, char **argv) {
         if (!c) continue;
         if (c->connection != DRM_MODE_CONNECTED) { drmModeFreeConnector(c); continue; }
 
-        /* Build connector name string e.g. "HDMI-A-2" */
         const char *type_str = (c->connector_type < 21)
                                ? conn_type_names[c->connector_type] : "Unknown";
         char cname[64];
@@ -683,7 +623,7 @@ int main(int argc, char **argv) {
         drmDropMaster(fd); VT_CLEANUP(); return 1;
     }
 
-    /* ── Build LUTs and CTM ─────────────────────────────────────────────── */
+    /* Build LUTs and CTM */
     drm_lut_entry *deg_lut, *gam_lut;
     uint64_t ctm9[9];
 
@@ -693,16 +633,13 @@ int main(int argc, char **argv) {
         build_ctm_identity(ctm9);
     } else {
         deg_lut = build_degamma_srgb(LUT_SIZE);
-        gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits);
-        /* Build gamut expansion matrix (identity → target, blended by gamut_pct). */
+        gam_lut = build_gamma_pq(LUT_SIZE, (double)sdr_nits, (double)midtone_gamma);
         double t = gamut_pct / 100.0;
         double gamut_mat[3][3];
         const double (*target)[3] = (gamut_mode == 1) ? CTM_709_TO_DCIP3 : CTM_709_TO_2020;
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 3; c++)
                 gamut_mat[r][c] = (r==c ? 1.0 : 0.0) * (1.0-t) + target[r][c] * t;
-        /* Apply saturation matrix first (in sRGB linear), then gamut expansion:
-         * combined = gamut_mat × sat_mat  (right-to-left in transform order). */
         double sat_mat[3][3];
         build_sat_mat(saturation_pct / 100.0, sat_mat);
         double combined[3][3];
@@ -716,7 +653,6 @@ int main(int argc, char **argv) {
     free(deg_lut); free(gam_lut);
     printf("blobs: DEGAMMA=%u CTM=%u GAMMA=%u\n", deg_blob, ctm_blob, gam_blob);
 
-    /* ── Get property IDs ───────────────────────────────────────────────── */
     uint32_t p_deg    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "DEGAMMA_LUT");
     uint32_t p_ctm    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "CTM");
     uint32_t p_gam    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,     "GAMMA_LUT");
@@ -725,22 +661,13 @@ int main(int argc, char **argv) {
     printf("props: DEGAMMA=%u CTM=%u GAMMA=%u HDR=%u Colorspace=%u\n",
            p_deg, p_ctm, p_gam, p_hdr, p_cspace);
 
-    /* ── Commit color pipeline ──────────────────────────────────────────── */
     int ret;
     if (is_nvidia) {
-        /*
-         * NVIDIA path: legacy 1D gamma ramp (PQ tonemapping, no gamut expansion).
-         * Same approach as KWin Plasma 6 on NVIDIA.
-         * Gamut expansion requires CTM which nvidia-drm does not expose.
-         */
-        ret = set_nvidia_gamma_pq(fd, crtc_id, (double)sdr_nits, reset);
-        printf("NVIDIA legacy gamma (sRGB→PQ): ret=%d  errno=%d (%s)\n",
+        ret = set_nvidia_gamma_pq(fd, crtc_id, (double)sdr_nits,
+                                  (double)midtone_gamma, reset);
+        printf("NVIDIA legacy gamma (sRGB→midtone→PQ): ret=%d  errno=%d (%s)\n",
                ret, errno, ret ? strerror(errno) : "ok");
     } else {
-        /*
-         * AMD/Intel path: full atomic pipeline — DEGAMMA→CTM→GAMMA.
-         * Provides both PQ tonemapping AND gamut expansion (BT.2020/DCI-P3).
-         */
         drmModeAtomicReqPtr req = drmModeAtomicAlloc();
         if (p_deg) drmModeAtomicAddProperty(req, crtc_id, p_deg, reset ? 0 : deg_blob);
         if (p_ctm) drmModeAtomicAddProperty(req, crtc_id, p_ctm, reset ? 0 : ctm_blob);
@@ -751,7 +678,6 @@ int main(int argc, char **argv) {
         drmModeAtomicFree(req);
     }
 
-    /* ── Commit HDR metadata + colorspace ──────────────────────────────── */
     int hdr_ret = -1;
     if (p_hdr && p_cspace) {
         uint64_t cspace_val = reset ? 0 : get_enum_val(fd, p_cspace, "BT2020_RGB");
@@ -766,7 +692,6 @@ int main(int argc, char **argv) {
         uint32_t p_bpc      = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR,  "max_requested_bpc");
         uint32_t p_vrr      = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR,  "vrr_enabled");
 
-        /* Save VRR state and disable it before modeset to avoid black-screen glitch */
         uint64_t vrr_saved = 0;
         if (p_vrr) {
             drmModeObjectPropertiesPtr oprops =
@@ -782,7 +707,7 @@ int main(int argc, char **argv) {
                 drmModeAtomicAddProperty(vrr_req, conn_id, p_vrr, 0);
                 drmModeAtomicCommit(fd, vrr_req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
                 drmModeAtomicFree(vrr_req);
-                usleep(50000);  /* 50 ms — let panel exit VRR mode */
+                usleep(50000);
                 printf("VRR disabled (was %llu) before modeset\n", (unsigned long long)vrr_saved);
             }
         }
@@ -795,15 +720,14 @@ int main(int argc, char **argv) {
         }
 
         drmModeAtomicReqPtr req2 = drmModeAtomicAlloc();
-        if (p_crtc_id)          drmModeAtomicAddProperty(req2, conn_id, p_crtc_id,  crtc_id);
-                                 drmModeAtomicAddProperty(req2, conn_id, p_hdr,      hdr_blob);
-                                 drmModeAtomicAddProperty(req2, conn_id, p_cspace,   cspace_val);
-        if (p_bpc && !reset)    drmModeAtomicAddProperty(req2, conn_id, p_bpc,      (uint64_t)max_bpc);
-        if (p_crtc_act)         drmModeAtomicAddProperty(req2, crtc_id, p_crtc_act, 1);
+        if (p_crtc_id)       drmModeAtomicAddProperty(req2, conn_id, p_crtc_id,  crtc_id);
+                              drmModeAtomicAddProperty(req2, conn_id, p_hdr,      hdr_blob);
+                              drmModeAtomicAddProperty(req2, conn_id, p_cspace,   cspace_val);
+        if (p_bpc && !reset) drmModeAtomicAddProperty(req2, conn_id, p_bpc,      (uint64_t)max_bpc);
+        if (p_crtc_act)      drmModeAtomicAddProperty(req2, crtc_id, p_crtc_act, 1);
         if (p_mode_id && mode_blob)
-                                drmModeAtomicAddProperty(req2, crtc_id, p_mode_id,  mode_blob);
+                             drmModeAtomicAddProperty(req2, crtc_id, p_mode_id,  mode_blob);
 
-        /* Try without ALLOW_MODESET first (avoids blank if driver supports it) */
         hdr_ret = drmModeAtomicCommit(fd, req2, DRM_MODE_ATOMIC_NONBLOCK, NULL);
         if (hdr_ret != 0) {
             hdr_ret = drmModeAtomicCommit(fd, req2, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
@@ -816,9 +740,8 @@ int main(int argc, char **argv) {
         if (hdr_blob)  drmModeDestroyPropertyBlob(fd, hdr_blob);
         if (mode_blob) drmModeDestroyPropertyBlob(fd, mode_blob);
 
-        /* Restore VRR if it was enabled */
         if (p_vrr && vrr_saved && hdr_ret == 0) {
-            usleep(100000);  /* 100 ms — let HDR modeset settle */
+            usleep(100000);
             drmModeAtomicReqPtr vrr_req = drmModeAtomicAlloc();
             drmModeAtomicAddProperty(vrr_req, conn_id, p_vrr, vrr_saved);
             int vrr_ret = drmModeAtomicCommit(fd, vrr_req, DRM_MODE_ATOMIC_NONBLOCK, NULL);
@@ -844,16 +767,17 @@ int main(int argc, char **argv) {
             printf("✓ reset: SDR restored\n");
         } else if (is_nvidia) {
             printf("✓ NVIDIA HDR ACTIVE (PQ tonemapping only — no gamut expansion)\n"
-                   "  sRGB→PQ via legacy gamma  SDR white=%d nits  peak=%d nits  bpc=%d\n"
-                   "  For wide-color gamut on NVIDIA: use Gamescope (Vulkan-based)\n",
-                   sdr_nits, peak_nits, max_bpc);
+                   "  sRGB→midtone→PQ via legacy gamma  SDR white=%d nits  peak=%d nits\n"
+                   "  midtone_gamma=%d%%  bpc=%d\n",
+                   sdr_nits, peak_nits, midtone_gamma, max_bpc);
         } else {
-            printf("✓ HDR10 ACTIVE: sRGB→linear→%s→PQ pipeline live\n"
-                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%  saturation=%d%%  bpc=%d\n",
-                   gmode_str, sdr_nits, peak_nits, gamut_pct, saturation_pct, max_bpc);
+            printf("✓ HDR10 ACTIVE: sRGB→linear→%s→midtone→PQ pipeline live\n"
+                   "  SDR white=%d nits  peak=%d nits  gamut=%d%%  sat=%d%%  "
+                   "midtone_gamma=%d%%  bpc=%d\n",
+                   gmode_str, sdr_nits, peak_nits, gamut_pct, saturation_pct,
+                   midtone_gamma, max_bpc);
         }
 
-        /* HDMI-CEC: announce active source so the TV switches input automatically */
         if (!reset && access("/dev/cec0", F_OK) == 0) {
             int cec = system("cec-ctl --device=0 --active-source phys-addr=0.0.0.0"
                              " >/dev/null 2>&1");
@@ -864,5 +788,168 @@ int main(int argc, char **argv) {
     } else {
         printf("pipeline ret=%d  HDR ret=%d\n", ret, hdr_ret);
     }
+
+#undef VT_CLEANUP
     return (ret != 0);
+}
+
+/* ── daemon loop ─────────────────────────────────────────────────────────── */
+/*
+ * Stays alive after initial apply. Writes PID file. Installs SIGUSR1 handler.
+ * On SIGUSR1: re-reads conf and calls do_apply() again.
+ * Panel sends reload via: pkexec kms-hdr --reload
+ */
+static void run_daemon(ApplyCtx *base_ctx) {
+    FILE *pf = fopen(PID_FILE, "w");
+    if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
+
+    signal(SIGUSR1, sigusr1_handler);
+    signal(SIGTERM, SIG_DFL); /* clean exit on SIGTERM */
+
+    printf("kms-hdr daemon running (PID %d). Send SIGUSR1 or run 'kms-hdr --reload' to re-apply.\n",
+           getpid());
+
+    /* Use inotify on /etc/kms-hdr.conf as secondary trigger (complements SIGUSR1) */
+    int ifd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (ifd >= 0)
+        inotify_add_watch(ifd, CONF_PATH, IN_CLOSE_WRITE | IN_MOVED_TO);
+
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        if (ifd >= 0) FD_SET(ifd, &rfds);
+        /* select blocks until inotify event or signal (EINTR) */
+        int sr = select(ifd >= 0 ? ifd + 1 : 1, &rfds, NULL, NULL, NULL);
+
+        int triggered = g_reload;
+        if (sr > 0 && ifd >= 0 && FD_ISSET(ifd, &rfds)) {
+            /* drain inotify events */
+            char ibuf[sizeof(struct inotify_event) + NAME_MAX + 1];
+            while (read(ifd, ibuf, sizeof(ibuf)) > 0) {}
+            triggered = 1;
+        }
+
+        if (triggered) {
+            g_reload = 0;
+            int sn, pn, gp, gm, bpc, sat, odm, mtg;
+            load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg);
+            ApplyCtx ctx = *base_ctx;
+            ctx.sdr_nits      = sn;
+            ctx.peak_nits     = pn;
+            ctx.gamut_pct     = gp;
+            ctx.gamut_mode    = gm;
+            ctx.max_bpc       = bpc;
+            ctx.saturation_pct = sat;
+            ctx.midtone_gamma  = mtg;
+            /* In daemon re-apply, trust saved conf values over EDID re-detection */
+            ctx.explicit_peak       = 1;
+            ctx.explicit_gamut_mode = 1;
+            printf("\n[daemon] conf changed — re-applying...\n");
+            do_apply(&ctx);
+        }
+    }
+
+    if (ifd >= 0) close(ifd);
+    unlink(PID_FILE);
+}
+
+/* ── main ────────────────────────────────────────────────────────────────── */
+int main(int argc, char **argv) {
+    /* --save-game: dispatched immediately */
+    if (argc >= 2 && strcmp(argv[1], "--save-game") == 0) {
+        if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
+        return save_game_conf(argc - 1, argv + 1);
+    }
+
+    /* --reload: send SIGUSR1 to running daemon */
+    if (argc >= 2 && strcmp(argv[1], "--reload") == 0) {
+        if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
+        FILE *pf = fopen(PID_FILE, "r");
+        if (!pf) { fprintf(stderr, "daemon not running (no %s)\n", PID_FILE); return 1; }
+        int pid = 0; fscanf(pf, "%d", &pid); fclose(pf);
+        if (pid <= 0) { fprintf(stderr, "invalid PID in %s\n", PID_FILE); return 1; }
+        if (kill(pid, SIGUSR1) != 0) { perror("kill"); return 1; }
+        printf("reload signal sent to daemon PID %d\n", pid);
+        return 0;
+    }
+
+    ApplyCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.sdr_nits      = DEFAULT_SDR_NITS;
+    ctx.peak_nits     = DEFAULT_PEAK_NITS;
+    ctx.gamut_pct     = DEFAULT_GAMUT;
+    ctx.gamut_mode    = DEFAULT_GAMUT_MODE;
+    ctx.max_bpc       = DEFAULT_MAX_BPC;
+    ctx.saturation_pct = DEFAULT_SATURATION;
+    ctx.midtone_gamma  = DEFAULT_MIDTONE_GAMMA;
+
+    int save = 0, save_only = 0, daemon_mode = 0;
+    int oled_dim_min = 0;
+
+    /* Load defaults from conf */
+    {
+        int sn, pn, gp, gm, bpc, sat, odm, mtg;
+        load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg);
+        ctx.sdr_nits       = sn;
+        ctx.peak_nits      = pn;
+        ctx.gamut_pct      = gp;
+        ctx.gamut_mode     = gm;
+        ctx.max_bpc        = bpc;
+        ctx.saturation_pct = sat;
+        ctx.midtone_gamma  = mtg;
+        oled_dim_min = odm;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if      (strcmp(argv[i], "reset")            == 0) ctx.reset         = 1;
+        else if (strcmp(argv[i], "--help")            == 0 ||
+                 strcmp(argv[i], "-h")                == 0) { usage(argv[0]); return 0; }
+        else if (strcmp(argv[i], "--save")            == 0) save             = 1;
+        else if (strcmp(argv[i], "--save-only")       == 0) save_only        = 1;
+        else if (strcmp(argv[i], "--no-vt-switch")    == 0) ctx.no_vt_switch = 1;
+        else if (strcmp(argv[i], "--daemon")          == 0) daemon_mode      = 1;
+        else if ((strcmp(argv[i], "--card")   == 0 ||
+                  strcmp(argv[i], "--output") == 0) && i+1 < argc)
+            snprintf(ctx.card_path, sizeof(ctx.card_path), "%s", argv[++i]);
+        else if ((strcmp(argv[i], "--connector") == 0 ||
+                  strcmp(argv[i], "--display")   == 0) && i+1 < argc)
+            snprintf(ctx.conn_name, sizeof(ctx.conn_name), "%s", argv[++i]);
+        else if (strcmp(argv[i], "--sdr-nits")      == 0 && i+1 < argc) ctx.sdr_nits      = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--peak-nits")     == 0 && i+1 < argc) { ctx.peak_nits = atoi(argv[++i]); ctx.explicit_peak = 1; }
+        else if (strcmp(argv[i], "--gamut")         == 0 && i+1 < argc) ctx.gamut_pct     = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bpc")           == 0 && i+1 < argc) ctx.max_bpc       = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--saturation")    == 0 && i+1 < argc) ctx.saturation_pct = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--midtone-gamma") == 0 && i+1 < argc) ctx.midtone_gamma  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--oled-dim-min")  == 0 && i+1 < argc) oled_dim_min       = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gamut-mode")    == 0 && i+1 < argc) {
+            const char *m = argv[++i];
+            ctx.gamut_mode = strcmp(m, "dci-p3") == 0 ? 1 :
+                             strcmp(m, "srgb")   == 0 ? 2 : 0;
+            ctx.explicit_gamut_mode = 1;
+        }
+        else if (strcmp(argv[i], "--dim-to") == 0 && i+1 < argc) {
+            int n = atoi(argv[++i]);
+            ctx.sdr_nits  = n;
+            ctx.peak_nits = n * 4;
+            ctx.explicit_peak = 1;
+        }
+        /* forward-compat passthrough */
+        else if (strcmp(argv[i], "--oled-preset") == 0 && i+1 < argc) { ++i; }
+        else { fprintf(stderr, "unknown arg: %s  (try --help)\n", argv[i]); return 1; }
+    }
+
+    if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
+
+    if ((save || save_only) && !ctx.reset)
+        save_conf(ctx.sdr_nits, ctx.peak_nits, ctx.gamut_pct, ctx.gamut_mode,
+                  ctx.max_bpc, ctx.saturation_pct, oled_dim_min, ctx.midtone_gamma);
+
+    if (save_only) return 0;
+
+    int ret = do_apply(&ctx);
+
+    if (ret == 0 && daemon_mode)
+        run_daemon(&ctx);  /* enters infinite loop */
+
+    return ret;
 }

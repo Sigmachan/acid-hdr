@@ -5,10 +5,10 @@ After=display-manager.service
 Wants=display-manager.service
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/kms-hdr
+Type=simple
+PIDFile=/run/kms-hdr.pid
+ExecStart=/usr/local/bin/kms-hdr --daemon
 ExecStop=/usr/local/bin/kms-hdr reset
-RemainAfterExit=yes
 Restart=on-failure
 RestartSec=3s
 StartLimitBurst=4
