@@ -4,36 +4,36 @@ POLKIT  ?= /usr/share/polkit-1/actions
 CFLAGS  := -O2 $(shell pkg-config --cflags libdrm)
 LIBS    := $(shell pkg-config --libs libdrm) -lm
 
-all: cosmic-hdr
+all: kms-hdr
 
-cosmic-hdr: cosmic-hdr.c
+kms-hdr: cosmic-hdr.c
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 
-CALDIR  ?= /usr/local/lib/cosmic-hdr
+CALDIR  ?= /usr/local/lib/kms-hdr
 
-install: cosmic-hdr
-	install -Dm755 cosmic-hdr                         $(DESTDIR)$(PREFIX)/bin/cosmic-hdr
-	install -Dm755 hdr-game                           $(DESTDIR)$(PREFIX)/bin/hdr-game
-	install -Dm644 cosmic-hdr.service                 $(DESTDIR)$(SVCDIR)/cosmic-hdr.service
-	install -Dm644 cosmic-hdr.policy                  $(DESTDIR)$(POLKIT)/ru.sigmachan.cosmic-hdr.policy
-	install -Dm755 hdr-cal.py                         $(DESTDIR)$(CALDIR)/hdr-cal.py
+install: kms-hdr
+	install -Dm755 kms-hdr                      $(DESTDIR)$(PREFIX)/bin/kms-hdr
+	install -Dm755 hdr-game                     $(DESTDIR)$(PREFIX)/bin/hdr-game
+	install -Dm644 kms-hdr.service              $(DESTDIR)$(SVCDIR)/kms-hdr.service
+	install -Dm644 kms-hdr.policy               $(DESTDIR)$(POLKIT)/ru.sigmachan.kms-hdr.policy
+	install -Dm755 hdr-cal.py                   $(DESTDIR)$(CALDIR)/hdr-cal.py
 
 enable: install
 	systemctl daemon-reload
-	systemctl enable --now cosmic-hdr.service
+	systemctl enable --now kms-hdr.service
 
 disable:
-	systemctl disable --now cosmic-hdr.service || true
+	systemctl disable --now kms-hdr.service || true
 
 uninstall: disable
-	rm -f $(DESTDIR)$(PREFIX)/bin/cosmic-hdr
+	rm -f $(DESTDIR)$(PREFIX)/bin/kms-hdr
 	rm -f $(DESTDIR)$(PREFIX)/bin/hdr-game
-	rm -f $(DESTDIR)$(SVCDIR)/cosmic-hdr.service
-	rm -f $(DESTDIR)$(POLKIT)/ru.sigmachan.cosmic-hdr.policy
+	rm -f $(DESTDIR)$(SVCDIR)/kms-hdr.service
+	rm -f $(DESTDIR)$(POLKIT)/ru.sigmachan.kms-hdr.policy
 	rm -rf $(DESTDIR)$(CALDIR)
 	systemctl daemon-reload
 
 clean:
-	rm -f cosmic-hdr
+	rm -f kms-hdr
 
 .PHONY: all install enable disable uninstall clean

@@ -9,7 +9,7 @@
 #   hdr-game [options] -- /path/to/game [game-args]
 #   hdr-game --vibrance 400 --mango -- %command%
 #
-# Options (all optional — defaults from /etc/cosmic-hdr.conf then built-ins):
+# Options (all optional — defaults from /etc/kms-hdr.conf then built-ins):
 #   --vibrance N        Digital vibrance -1024..1023 (NVIDIA only, 0=neutral 512=vivid, default 200)
 #   --no-smooth-motion  Disable RTX Smooth Motion frame generation (enabled by default on NVIDIA)
 #   --no-reflex         Disable NVIDIA Reflex / NvAPI (enabled by default on NVIDIA)
@@ -38,15 +38,15 @@ ITM=1
 MANGO=0
 UPSCALE=""
 
-# ── read tuning from /etc/cosmic-hdr.conf ────────────────────────────────
-if [[ -f /etc/cosmic-hdr.conf ]]; then
+# ── read tuning from /etc/kms-hdr.conf ────────────────────────────────
+if [[ -f /etc/kms-hdr.conf ]]; then
     while IFS='=' read -r k v; do
         [[ -z "$v" || "$k" == \#* ]] && continue
         case "$k" in
             PEAK_NITS) PEAK_NITS=$v ;;
             SDR_NITS)  SDR_NITS=$v  ;;
         esac
-    done < /etc/cosmic-hdr.conf
+    done < /etc/kms-hdr.conf
 fi
 
 # ── read NVIDIA gaming config from /etc/hdr-game.conf ────────────────────

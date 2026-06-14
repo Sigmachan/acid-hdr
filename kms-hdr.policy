@@ -3,17 +3,16 @@
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <action id="ru.sigmachan.cosmic-hdr.apply">
+  <action id="ru.sigmachan.kms-hdr.apply">
     <description>Apply HDR display color pipeline</description>
     <message>Authentication is required to apply HDR display settings</message>
     <icon_name>preferences-desktop-display</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
-      <!-- active local graphical session: no password prompt -->
       <allow_active>yes</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/cosmic-hdr</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/kms-hdr</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

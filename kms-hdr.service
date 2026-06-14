@@ -1,0 +1,18 @@
+[Unit]
+Description=Universal KMS HDR injector (BT.2020 + PQ + CTM + metadata)
+Documentation=https://github.com/Sigmachan/kms-hdr
+After=display-manager.service
+Wants=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kms-hdr
+ExecStop=/usr/local/bin/kms-hdr reset
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=3s
+StartLimitBurst=4
+StartLimitIntervalSec=30s
+
+[Install]
+WantedBy=multi-user.target

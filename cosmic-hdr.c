@@ -1,5 +1,6 @@
 /*
- * cosmic-hdr.c  — HDR10 + BT.2020/DCI-P3 color pipeline injector via KMS atomic
+ * kms-hdr (cosmic-hdr.c) — Universal KMS HDR injector for Linux
+ * HDR10 + BT.2020/DCI-P3 color pipeline via DRM atomic, compositor-agnostic.
  *
  * Two pipeline modes (auto-detected by GPU driver):
  *   AMD/Intel: DEGAMMA (sRGB→linear) → CTM (BT.709→gamut) → GAMMA (linear→PQ)
@@ -8,19 +9,20 @@
  *              + HDR_OUTPUT_METADATA + Colorspace=BT2020_RGB
  *
  * Steals DRM master via VT switch (tty1→tty2→tty1, screen blanks ~0.5s).
- * Properties persist after master release (cosmic-comp doesn't reset them).
+ * Properties persist after master release (any compositor).
  *
  * Usage (must be root / pkexec):
- *   cosmic-hdr                               apply (reads /etc/cosmic-hdr.conf)
- *   cosmic-hdr reset                         restore SDR
- *   cosmic-hdr --save --sdr-nits 203 ...    save to conf + apply
- *   cosmic-hdr --card /dev/dri/card1        override DRM device (auto-detected by default)
- *   cosmic-hdr --connector HDMI-A-2         override connector name
- *   cosmic-hdr --sdr-nits 203              set SDR white brightness (nits)
- *   cosmic-hdr --peak-nits 800             set display peak luminance (nits)
- *   cosmic-hdr --gamut 100                 gamut expansion blend 0-100%
- *   cosmic-hdr --gamut-mode [bt2020|dci-p3|srgb]
- *   cosmic-hdr --bpc [8|10|12]             request output bit depth
+ *   kms-hdr                               apply (reads /etc/kms-hdr.conf)
+ *   kms-hdr reset                         restore SDR
+ *   kms-hdr --save --sdr-nits 203 ...    save to conf + apply
+ *   kms-hdr --card /dev/dri/card1        override DRM device (auto-detected by default)
+ *   kms-hdr --connector HDMI-A-2         override connector name
+ *   kms-hdr --sdr-nits 203              set SDR white brightness (nits)
+ *   kms-hdr --peak-nits 800             set display peak luminance (nits)
+ *   kms-hdr --gamut 100                 gamut expansion blend 0-100%
+ *   kms-hdr --gamut-mode [bt2020|dci-p3|srgb]
+ *   kms-hdr --bpc [8|10|12]             request output bit depth
+ *   kms-hdr --saturation [50-200]       colour saturation % (BT.709 matrix)
  */
 
 #include <stdio.h>
@@ -40,7 +42,7 @@
 #include <drm_mode.h>
 
 /* ── config ──────────────────────────────────────────────────────────────── */
-#define CONF_PATH  "/etc/cosmic-hdr.conf"
+#define CONF_PATH  "/etc/kms-hdr.conf"
 #define LUT_SIZE   4096
 #define MAX_CARDS  8
 #define MASTER_RETRY_MS  500   /* ms between drmSetMaster retries */
