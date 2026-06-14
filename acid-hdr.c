@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
     printf("CTM commit ret=%d  errno=%d (%s)\n", ret, errno, ret ? strerror(errno) : "ok");
     drmModeAtomicFree(req);
 
-    /* HDR + Colorspace: needs ALLOW_MODESET */
+    /* HDR + Colorspace: needs ALLOW_MODESET with full CRTC state */
     int hdr_ret = -1;
     if (p_hdr && p_cspace) {
         uint64_t cspace_val = reset ? 0
@@ -316,15 +316,39 @@ int main(int argc, char **argv) {
 
         printf("  Colorspace BT2020_RGB enum value = %llu\n", (unsigned long long)cspace_val);
 
+        /* ALLOW_MODESET requires complete CRTC state in the commit */
+        uint32_t p_crtc_id    = get_prop_id(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+        uint32_t p_crtc_act   = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "ACTIVE");
+        uint32_t p_mode_id    = get_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC,      "MODE_ID");
+
+        /* Grab the current mode from the live CRTC */
+        drmModeCrtcPtr cur_crtc = drmModeGetCrtc(fd, crtc_id);
+        uint32_t mode_blob = 0;
+        if (cur_crtc && p_mode_id) {
+            drmModeCreatePropertyBlob(fd, &cur_crtc->mode,
+                                      sizeof(cur_crtc->mode), &mode_blob);
+            drmModeFreeCrtc(cur_crtc);
+        }
+        printf("  modeset props: CRTC_ID=%u ACTIVE=%u MODE_ID=%u  mode_blob=%u\n",
+               p_crtc_id, p_crtc_act, p_mode_id, mode_blob);
+
         drmModeAtomicReqPtr req2 = drmModeAtomicAlloc();
+        /* connector: tie to CRTC + HDR + Colorspace */
+        if (p_crtc_id)  drmModeAtomicAddProperty(req2, conn_id, p_crtc_id,  crtc_id);
         drmModeAtomicAddProperty(req2, conn_id, p_hdr,    hdr_blob);
         drmModeAtomicAddProperty(req2, conn_id, p_cspace, cspace_val);
+        /* CRTC: must be active with a valid mode */
+        if (p_crtc_act) drmModeAtomicAddProperty(req2, crtc_id, p_crtc_act, 1);
+        if (p_mode_id && mode_blob)
+                        drmModeAtomicAddProperty(req2, crtc_id, p_mode_id,   mode_blob);
+
         hdr_ret = drmModeAtomicCommit(fd, req2,
-            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+            DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
         printf("HDR+Colorspace commit ret=%d  errno=%d (%s)\n",
                hdr_ret, errno, hdr_ret ? strerror(errno) : "ok");
         drmModeAtomicFree(req2);
-        if (hdr_blob) drmModeDestroyPropertyBlob(fd, hdr_blob);
+        if (hdr_blob)  drmModeDestroyPropertyBlob(fd, hdr_blob);
+        if (mode_blob) drmModeDestroyPropertyBlob(fd, mode_blob);
     }
 
     /* ── release master and switch back ──────────────────────────────── */
