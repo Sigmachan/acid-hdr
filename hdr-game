@@ -1,37 +1,168 @@
 #!/bin/bash
-# hdr-game — launch a Steam game (or any Vulkan app) inside Gamescope with HDR
+# hdr-game — HDR + NVIDIA Smooth Motion + Reflex + Digital Vibrance launcher
+# Wraps any game/app in Gamescope with the full feature stack.
 #
-# Steam launch option (paste into game properties → Launch Options):
+# Steam launch option (paste into Properties → Launch Options):
 #   ENABLE_GAMESCOPE_WSI=1 DXVK_HDR=1 hdr-game %command%
 #
-# Manual use:
-#   hdr-game /path/to/game --game-args
-#   hdr-game -- /path/to/game --game-args
+# Manual:
+#   hdr-game [options] -- /path/to/game [game-args]
+#   hdr-game --vibrance 400 --mango -- %command%
 #
-# Tuning: edit the variables below to match your display.
+# Options (all optional — defaults from /etc/cosmic-hdr.conf then built-ins):
+#   --vibrance N        Digital vibrance -1024..1023 (NVIDIA only, 0=neutral 512=vivid, default 200)
+#   --no-smooth-motion  Disable RTX Smooth Motion frame generation (enabled by default on NVIDIA)
+#   --no-reflex         Disable NVIDIA Reflex / NvAPI (enabled by default on NVIDIA)
+#   --no-itm            Disable inverse tone-mapping — use for native HDR10 titles
+#   --mango             Attach MangoApp FPS/telemetry overlay
+#   --width W           Gamescope output width  (default 3840 or $GAMESCOPE_W)
+#   --height H          Gamescope output height (default 2160 or $GAMESCOPE_H)
+#   --fps N             Target framerate (default 120 or $GAMESCOPE_R)
+#   --peak-nits N       HDR peak luminance override (default from conf, 800)
+#   --sdr-nits N        SDR white point override    (default from conf, 203)
+#   --upscale fsr|nis|integer  Upscaling algorithm (default: none)
+#   --                  End of hdr-game flags; everything after is the game command
 
-GAMESCOPE_W=${GAMESCOPE_W:-3840}
-GAMESCOPE_H=${GAMESCOPE_H:-2160}
-GAMESCOPE_R=${GAMESCOPE_R:-120}
+set -euo pipefail
 
-# A85H OLED peak ≈ 800–1000 nits; 800 is the conservative safe value.
-HDR_ITM_TARGET=${HDR_ITM_TARGET:-800}
+# ── built-in defaults ─────────────────────────────────────────────────────
+W=${GAMESCOPE_W:-3840}
+H=${GAMESCOPE_H:-2160}
+FPS=${GAMESCOPE_R:-120}
+PEAK_NITS=800
+SDR_NITS=203
+VIBRANCE=200    # nvibrant scale: 0=neutral, 512=vivid, 1023=max
+SMOOTH_MOTION=1
+REFLEX=1
+ITM=1
+MANGO=0
+UPSCALE=""
 
-# Standard SDR reference white (CTA-861-H: 203 nits).
-HDR_SDR_NITS=${HDR_SDR_NITS:-203}
+# ── read tuning from /etc/cosmic-hdr.conf ────────────────────────────────
+if [[ -f /etc/cosmic-hdr.conf ]]; then
+    while IFS='=' read -r k v; do
+        [[ -z "$v" || "$k" == \#* ]] && continue
+        case "$k" in
+            PEAK_NITS) PEAK_NITS=$v ;;
+            SDR_NITS)  SDR_NITS=$v  ;;
+        esac
+    done < /etc/cosmic-hdr.conf
+fi
 
-# Strip the leading '--' separator if Steam/shell adds one.
-[[ "$1" == "--" ]] && shift
+# ── read NVIDIA gaming config from /etc/hdr-game.conf ────────────────────
+if [[ -f /etc/hdr-game.conf ]]; then
+    while IFS='=' read -r k v; do
+        [[ -z "$v" || "$k" == \#* ]] && continue
+        case "$k" in
+            SMOOTH_MOTION) SMOOTH_MOTION=$v ;;
+            REFLEX)        REFLEX=$v        ;;
+            VIBRANCE)      VIBRANCE=$v      ;;
+            UPSCALE)       UPSCALE=$v       ;;
+            DLDSR)         [[ "$v" == "1" ]] && _DLDSR=1 || _DLDSR=0 ;;
+            GAMESCOPE_W)   W=$v             ;;
+            GAMESCOPE_H)   H=$v             ;;
+            GAMESCOPE_R)   FPS=$v           ;;
+        esac
+    done < /etc/hdr-game.conf
+fi
+_DLDSR=${_DLDSR:-0}
 
-exec gamescope \
-    -W "$GAMESCOPE_W" -H "$GAMESCOPE_H" \
-    -r "$GAMESCOPE_R" \
-    -f \
-    --force-windows-fullscreen \
-    --hdr-enabled \
-    --hdr-itm-enabled \
-    --hdr-itm-target-nits "$HDR_ITM_TARGET" \
-    --hdr-sdr-content-nits "$HDR_SDR_NITS" \
-    --hdr-itm-sdr-nits    "$HDR_SDR_NITS" \
-    --backend wayland \
-    -- "$@"
+# ── parse CLI flags ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vibrance)         VIBRANCE=$2;    shift 2 ;;
+        --no-smooth-motion) SMOOTH_MOTION=0; shift  ;;
+        --no-reflex)        REFLEX=0;        shift  ;;
+        --no-itm)           ITM=0;           shift  ;;
+        --mango)            MANGO=1;         shift  ;;
+        --width)            W=$2;            shift 2 ;;
+        --height)           H=$2;            shift 2 ;;
+        --fps)              FPS=$2;          shift 2 ;;
+        --peak-nits)        PEAK_NITS=$2;   shift 2 ;;
+        --sdr-nits)         SDR_NITS=$2;    shift 2 ;;
+        --upscale)          UPSCALE=$2;     shift 2 ;;
+        --)                 shift; break            ;;
+        *)                  break                   ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    echo "hdr-game: no command given. Usage: hdr-game [options] -- <command>" >&2
+    exit 1
+fi
+
+# ── detect NVIDIA GPU ─────────────────────────────────────────────────────
+IS_NVIDIA=0
+if [[ -e /dev/nvidia0 ]] && lspci -nn 2>/dev/null | grep -qi "10de:"; then
+    IS_NVIDIA=1
+fi
+
+# ── NVIDIA: digital vibrance via nvibrant (Wayland ioctl path) ───────────
+if [[ $IS_NVIDIA -eq 1 && $VIBRANCE -ne 0 ]] && command -v nvibrant &>/dev/null; then
+    # nvibrant accepts: nvibrant <value>  or  nvibrant <display> <value>
+    nvibrant "$VIBRANCE" 2>/dev/null \
+        || nvibrant "$DISPLAY" "$VIBRANCE" 2>/dev/null \
+        || true
+fi
+
+# ── NVIDIA: RTX Smooth Motion (VK_LAYER_NV_present implicit layer) ────────
+if [[ $IS_NVIDIA -eq 1 && $SMOOTH_MOTION -eq 1 ]]; then
+    export NVPRESENT_ENABLE_SMOOTH_MOTION=1
+fi
+
+# ── NVIDIA: Reflex via NvAPI (Proton + DXVK) ────────────────────────────
+if [[ $IS_NVIDIA -eq 1 && $REFLEX -eq 1 ]]; then
+    export PROTON_ENABLE_NVAPI=1
+    export DXVK_ENABLE_NVAPI=1
+fi
+
+# ── always-on Vulkan/HDR env ──────────────────────────────────────────────
+export ENABLE_GAMESCOPE_WSI=1
+export DXVK_HDR=1
+
+# ── build gamescope argument list ─────────────────────────────────────────
+GS_ARGS=(
+    -W "$W" -H "$H"
+    -r "$FPS"
+    -f
+    --force-windows-fullscreen
+    --hdr-enabled
+    --hdr-sdr-content-nits "$SDR_NITS"
+    --adaptive-sync
+    --backend wayland
+)
+
+# inverse tone mapping — off for native HDR10 titles (use --no-itm)
+if [[ $ITM -eq 1 ]]; then
+    GS_ARGS+=(
+        --hdr-itm-enabled
+        --hdr-itm-target-nits "$PEAK_NITS"
+        --hdr-itm-sdr-nits    "$SDR_NITS"
+    )
+fi
+
+# MangoApp overlay
+[[ $MANGO -eq 1 ]] && GS_ARGS+=(--mangoapp)
+
+# upscaling
+case "$UPSCALE" in
+    fsr)     GS_ARGS+=(-U --fsr-upscale-sharpness 5) ;;
+    nis)     GS_ARGS+=(-n --nis-sharpness 5)          ;;
+    dlss)    GS_ARGS+=(-U) ;;  # gamescope uses DLSS when available on NVIDIA
+    integer) GS_ARGS+=(-S integer)                    ;;
+esac
+
+# NVIDIA: force composition so Smooth Motion can intercept presents
+[[ $IS_NVIDIA -eq 1 ]] && GS_ARGS+=(--force-composition)
+
+# NVIDIA DLDSR: render at ~1.5× in each axis (2.25× pixels), display at native
+# game renders at higher res, NVIDIA driver applies DLDSR downscale filter
+if [[ $_DLDSR -eq 1 && $IS_NVIDIA -eq 1 ]]; then
+    export __GL_DLDSR_MULTIPLIER=2.25
+    DLDSR_W=$(( W * 3 / 2 ))
+    DLDSR_H=$(( H * 3 / 2 ))
+    GS_ARGS+=(-w "$DLDSR_W" -h "$DLDSR_H")
+fi
+
+# ── launch ────────────────────────────────────────────────────────────────
+exec gamescope "${GS_ARGS[@]}" -- "$@"

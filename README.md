@@ -22,15 +22,21 @@ The GUI panel shows everything derived from EDID — interface version (HDMI 2.1
 
 ## What it does
 
-| Feature | AMD / Intel | NVIDIA |
-|---------|:-----------:|:------:|
-| HDR10 metadata (PQ / ST 2084) | ✓ | ✓ |
-| Wide gamut — BT.2020 / DCI-P3 | ✓ | — ¹ |
-| 10 / 12 bpc output | ✓ | ✓ |
-| VRR / FreeSync / G-Sync safe | ✓ | ✓ |
-| Auto-detect display from EDID | ✓ | ✓ |
+| Feature | AMD / Intel | NVIDIA (desktop) | NVIDIA (gaming, hdr-game) |
+|---------|:-----------:|:----------------:|:-------------------------:|
+| HDR10 metadata (PQ / ST 2084) | ✓ | ✓ | ✓ (Gamescope) |
+| Wide gamut — BT.2020 / DCI-P3 | ✓ | — ¹ | ✓ (Gamescope CTM) |
+| Colour saturation matrix | ✓ | — ¹ | — |
+| 10 / 12 bpc output | ✓ | ✓ | ✓ |
+| VRR / FreeSync / G-Sync safe | ✓ | ✓ | ✓ |
+| Auto-detect display from EDID | ✓ | ✓ | ✓ |
+| RTX Smooth Motion | — | — | ✓ (Vulkan layer) |
+| NVIDIA Reflex | — | — | ✓ (NvAPI) |
+| Digital Vibrance | — | — | ✓ (nvibrant) |
+| FSR / NIS / DLSS upscaling | — | — | ✓ (Gamescope) |
+| DLDSR | — | — | ✓ |
 
-¹ NVIDIA's KMS driver does not expose the DRM CTM / DEGAMMA_LUT / GAMMA_LUT CRTC properties needed for full colour-pipeline control. On NVIDIA, cosmic-hdr falls back to a legacy 1D PQ gamma ramp via `drmModeCrtcSetGamma()` — the same technique KWin uses for Plasma 6 on NVIDIA. BT.2020 / DCI-P3 gamut expansion is silently skipped on NVIDIA.
+¹ NVIDIA's KMS driver does not expose the DRM CTM / DEGAMMA_LUT / GAMMA_LUT CRTC properties needed for full colour-pipeline control. On NVIDIA, cosmic-hdr falls back to a legacy 1D PQ gamma ramp via `drmModeCrtcSetGamma()` — the same technique KWin Plasma 6 uses on NVIDIA. BT.2020 / DCI-P3 gamut expansion and saturation are silently skipped. Use `hdr-game` for full feature support in games.
 
 ---
 
@@ -163,6 +169,72 @@ makepkg -si
 
 ---
 
+## NVIDIA Gaming
+
+On NVIDIA, the KMS driver doesn't expose the CTM/DEGAMMA/GAMMA properties needed for full colour-pipeline control, so the desktop-level HDR features (gamut expansion, saturation) are limited. Instead, **gaming features work through [Gamescope](https://github.com/ValveSoftware/gamescope)** via the `hdr-game` launcher script included in this package.
+
+### hdr-game
+
+Wraps any Vulkan game or Steam launch command in Gamescope with:
+
+| Feature | Implementation |
+|---------|---------------|
+| HDR10 output | `--hdr-enabled` + ITM tone-mapping |
+| RTX Smooth Motion | `NVPRESENT_ENABLE_SMOOTH_MOTION=1` (VK_LAYER_NV_present implicit layer) |
+| NVIDIA Reflex | `PROTON_ENABLE_NVAPI=1` + `DXVK_ENABLE_NVAPI=1` (low latency via NvAPI) |
+| Digital Vibrance | `nvibrant <value>` (ioctl to `/dev/nvidia-modeset`, Wayland-native) |
+| FSR / NIS / DLSS | Passed through to Gamescope upscaling |
+| DLDSR | `__GL_DLDSR_MULTIPLIER=2.25` + render resolution override |
+| MangoApp overlay | `--mangoapp` flag |
+| VRR / Adaptive Sync | `--adaptive-sync` |
+
+**Steam launch option:**
+
+```
+ENABLE_GAMESCOPE_WSI=1 DXVK_HDR=1 hdr-game %command%
+```
+
+**Manual launch:**
+
+```bash
+hdr-game -- /path/to/game --game-args
+hdr-game --vibrance 400 --mango --upscale fsr -- %command%
+hdr-game --no-smooth-motion --no-itm -- native-hdr-game
+```
+
+**All options:**
+
+```
+--vibrance N        Digital vibrance -1024..1023 (0=neutral, 512=vivid; NVIDIA only)
+--no-smooth-motion  Disable RTX Smooth Motion
+--no-reflex         Disable NVIDIA Reflex / NvAPI
+--no-itm            Disable inverse tone-mapping (for native HDR10 titles)
+--mango             Attach MangoApp overlay
+--width W           Gamescope output width  (default: 3840)
+--height H          Gamescope output height (default: 2160)
+--fps N             Framerate cap           (default: 120)
+--peak-nits N       HDR peak luminance override
+--sdr-nits N        SDR white point override
+--upscale fsr|nis|dlss|integer  Upscaling algorithm
+```
+
+Defaults for `--vibrance`, `--width`, `--height`, `--fps` are read from `/etc/hdr-game.conf` (managed by `cosmic-hdr-panel`). If the file doesn't exist, built-in defaults apply.
+
+**`/etc/hdr-game.conf` keys:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `SMOOTH_MOTION` | 1 | RTX Smooth Motion (0 or 1) |
+| `REFLEX` | 1 | NVIDIA Reflex via NvAPI (0 or 1) |
+| `VIBRANCE` | 200 | Digital vibrance, nvibrant scale -1024..1023 |
+| `UPSCALE` | none | `none` / `fsr` / `nis` / `dlss` / `integer` |
+| `DLDSR` | 0 | NVIDIA DLDSR (renders at 2.25× pixels, display native) |
+| `GAMESCOPE_W` | 3840 | Gamescope output width |
+| `GAMESCOPE_H` | 2160 | Gamescope output height |
+| `GAMESCOPE_R` | 120 | Gamescope target FPS |
+
+---
+
 ## Configuration
 
 Written to `/etc/cosmic-hdr.conf` by `cosmic-hdr --save ...` (runs as root via polkit):
@@ -173,6 +245,7 @@ PEAK_NITS=800
 GAMUT=100
 MAX_BPC=10
 GAMUT_MODE=bt2020
+SATURATION=100
 ```
 
 | Key | Default | Description |
@@ -182,6 +255,7 @@ GAMUT_MODE=bt2020
 | `GAMUT` | 100 | Gamut expansion blend 0–100%. 0 = sRGB passthrough, 100 = full target. |
 | `MAX_BPC` | 10 | Bit depth requested via `max_requested_bpc` DRM property. |
 | `GAMUT_MODE` | bt2020 | Target colour space: `bt2020`, `dci-p3`, or `srgb`. |
+| `SATURATION` | 100 | Colour saturation via BT.709 matrix. 100 = neutral, 150 = vivid, 50 = muted. |
 
 ---
 
@@ -196,11 +270,14 @@ Commands:
 Options:
   --card <path>             DRM device (default: auto-detected from sysfs EDID)
   --connector <name>        Connector name, e.g. HDMI-A-2 (default: auto-detected)
+  --output / --display      Aliases for --connector
   --sdr-nits <n>            SDR reference white, nits (default: config → 203)
   --peak-nits <n>           Display peak, nits (default: config → 800)
   --gamut <0-100>           Gamut expansion blend % (default: 100)
   --bpc <8|10|12>           Max requested bit depth (default: 10)
   --gamut-mode <mode>       bt2020 | dci-p3 | srgb (default: bt2020)
+  --saturation <50-200>     Colour saturation % via BT.709 matrix (default: 100)
+  --no-vt-switch            Skip VT switch to steal DRM master (for headless/boot use)
   --save                    Write /etc/cosmic-hdr.conf before applying
   --help                    Show this help
 ```
