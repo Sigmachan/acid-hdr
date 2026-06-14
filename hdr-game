@@ -10,28 +10,28 @@
 #   hdr-game --vibrance 400 --mango -- %command%
 #
 # Options (all optional — defaults from /etc/kms-hdr.conf then built-ins):
-#   --vibrance N        Digital vibrance -1024..1023 (NVIDIA only, 0=neutral 512=vivid, default 200)
+#   --vibrance N        Digital vibrance -1024..1023 (NVIDIA only, 0=neutral, default 0)
 #   --no-smooth-motion  Disable RTX Smooth Motion frame generation (enabled by default on NVIDIA)
 #   --no-reflex         Disable NVIDIA Reflex / NvAPI (enabled by default on NVIDIA)
 #   --no-itm            Disable inverse tone-mapping — use for native HDR10 titles
 #   --mango             Attach MangoApp FPS/telemetry overlay
-#   --width W           Gamescope output width  (default 3840 or $GAMESCOPE_W)
-#   --height H          Gamescope output height (default 2160 or $GAMESCOPE_H)
-#   --fps N             Target framerate (default 120 or $GAMESCOPE_R)
+#   --width W           Gamescope output width  (default from /etc/hdr-game.conf or 3840)
+#   --height H          Gamescope output height (default from /etc/hdr-game.conf or 2160)
+#   --fps N             Target framerate (default from /etc/hdr-game.conf or 120)
 #   --peak-nits N       HDR peak luminance override (default from conf, 800)
 #   --sdr-nits N        SDR white point override    (default from conf, 203)
-#   --upscale fsr|nis|integer  Upscaling algorithm (default: none)
+#   --upscale fsr|nis|integer|nearest  Upscaling algorithm (default: none)
 #   --                  End of hdr-game flags; everything after is the game command
 
 set -euo pipefail
 
 # ── built-in defaults ─────────────────────────────────────────────────────
-W=${GAMESCOPE_W:-3840}
-H=${GAMESCOPE_H:-2160}
-FPS=${GAMESCOPE_R:-120}
+W=3840
+H=2160
+FPS=120
 PEAK_NITS=800
 SDR_NITS=203
-VIBRANCE=200    # nvibrant scale: 0=neutral, 512=vivid, 1023=max
+VIBRANCE=0      # nvibrant scale: 0=neutral, 512=vivid, 1023=max
 SMOOTH_MOTION=1
 REFLEX=1
 ITM=1
@@ -59,9 +59,9 @@ if [[ -f /etc/hdr-game.conf ]]; then
             VIBRANCE)      VIBRANCE=$v      ;;
             UPSCALE)       UPSCALE=$v       ;;
             DLDSR)         [[ "$v" == "1" ]] && _DLDSR=1 || _DLDSR=0 ;;
-            GAMESCOPE_W)   W=$v             ;;
-            GAMESCOPE_H)   H=$v             ;;
-            GAMESCOPE_R)   FPS=$v           ;;
+            GS_WIDTH)      W=$v             ;;
+            GS_HEIGHT)     H=$v             ;;
+            GS_FPS)        FPS=$v           ;;
         esac
     done < /etc/hdr-game.conf
 fi
@@ -150,6 +150,7 @@ case "$UPSCALE" in
     nis)     GS_ARGS+=(-n --nis-sharpness 5)          ;;
     dlss)    GS_ARGS+=(-U) ;;  # gamescope uses DLSS when available on NVIDIA
     integer) GS_ARGS+=(-S integer)                    ;;
+    nearest) GS_ARGS+=(-S nearest)                    ;;
 esac
 
 # NVIDIA: force composition so Smooth Motion can intercept presents

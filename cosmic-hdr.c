@@ -67,23 +67,26 @@
 #define DEFAULT_SATURATION  100 /* 100 = neutral; 150 = vivid; 50 = desaturated */
 
 static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
-                      int *gamut_mode, int *max_bpc, int *saturation) {
-    *sdr_nits   = DEFAULT_SDR_NITS;
-    *peak_nits  = DEFAULT_PEAK_NITS;
-    *gamut_pct  = DEFAULT_GAMUT;
-    *gamut_mode = DEFAULT_GAMUT_MODE;
-    *max_bpc    = DEFAULT_MAX_BPC;
-    *saturation = DEFAULT_SATURATION;
+                      int *gamut_mode, int *max_bpc, int *saturation,
+                      int *oled_dim_min) {
+    *sdr_nits     = DEFAULT_SDR_NITS;
+    *peak_nits    = DEFAULT_PEAK_NITS;
+    *gamut_pct    = DEFAULT_GAMUT;
+    *gamut_mode   = DEFAULT_GAMUT_MODE;
+    *max_bpc      = DEFAULT_MAX_BPC;
+    *saturation   = DEFAULT_SATURATION;
+    *oled_dim_min = 0;
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int v; char s[64];
-        if (sscanf(line, "SDR_NITS=%d",     &v) == 1) *sdr_nits   = v;
-        if (sscanf(line, "PEAK_NITS=%d",    &v) == 1) *peak_nits  = v;
-        if (sscanf(line, "GAMUT=%d",        &v) == 1) *gamut_pct  = v;
-        if (sscanf(line, "MAX_BPC=%d",      &v) == 1) *max_bpc    = v;
-        if (sscanf(line, "SATURATION=%d",   &v) == 1) *saturation = v;
+        if (sscanf(line, "SDR_NITS=%d",     &v) == 1) *sdr_nits     = v;
+        if (sscanf(line, "PEAK_NITS=%d",    &v) == 1) *peak_nits    = v;
+        if (sscanf(line, "GAMUT=%d",        &v) == 1) *gamut_pct    = v;
+        if (sscanf(line, "MAX_BPC=%d",      &v) == 1) *max_bpc      = v;
+        if (sscanf(line, "SATURATION=%d",   &v) == 1) *saturation   = v;
+        if (sscanf(line, "OLED_DIM_MIN=%d", &v) == 1) *oled_dim_min = v;
         if (sscanf(line, "GAMUT_MODE=%63s", s)  == 1)
             *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
     }
@@ -91,15 +94,35 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
 }
 
 static void save_conf(int sdr_nits, int peak_nits, int gamut_pct,
-                      int gamut_mode, int max_bpc, int saturation) {
+                      int gamut_mode, int max_bpc, int saturation,
+                      int oled_dim_min) {
     FILE *f = fopen(CONF_PATH, "w");
     if (!f) { perror("save_conf: fopen " CONF_PATH); return; }
-    fprintf(f, "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\nGAMUT_MODE=%s\nSATURATION=%d\n",
-            sdr_nits, peak_nits, gamut_pct, max_bpc,
-            gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
-            saturation);
+    fprintf(f,
+        "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\n"
+        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\n",
+        sdr_nits, peak_nits, gamut_pct, max_bpc,
+        gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
+        saturation, oled_dim_min);
     fclose(f);
     printf("saved: %s\n", CONF_PATH);
+}
+
+/* Write /etc/hdr-game.conf from KEY=VAL pairs passed on the command line.
+ * Called when kms-hdr receives --save-game as first argument. */
+static int save_game_conf(int argc, char **argv) {
+    /* argv[0] == "--save-game", followed by KEY=VAL tokens */
+    const char *game_conf = "/etc/hdr-game.conf";
+    FILE *f = fopen(game_conf, "w");
+    if (!f) { perror("save_game_conf: fopen " "/etc/hdr-game.conf"); return 1; }
+    for (int i = 1; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        if (!eq) { fprintf(stderr, "save-game: expected KEY=VAL, got: %s\n", argv[i]); continue; }
+        fprintf(f, "%s\n", argv[i]);
+    }
+    fclose(f);
+    printf("saved: %s\n", game_conf);
+    return 0;
 }
 
 /* Auto-detect the DRM card device and connector name.
@@ -417,33 +440,46 @@ static int vt_switch(int tty_fd, int target_vt) {
 static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [OPTIONS] [reset]\n"
+        "       %s --save-game KEY=VAL ...\n"
         "\n"
         "Options:\n"
         "  --card /dev/dri/cardN    DRM device (alias: --output; auto-detected)\n"
         "  --connector NAME         Connector, e.g. HDMI-A-2 (alias: --display; auto-detected)\n"
         "  --save                   Write settings to " CONF_PATH " before applying\n"
+        "  --save-only              Write " CONF_PATH " and exit (no DRM operations)\n"
         "  --sdr-nits N             SDR white brightness in nits (default: 203 or from EDID)\n"
         "  --peak-nits N            Display peak luminance in nits (default: EDID or 800)\n"
         "  --gamut N                Gamut expansion blend 0-100%% (default 100)\n"
         "  --gamut-mode MODE        bt2020 | dci-p3 | srgb (default: from EDID colorimetry)\n"
         "  --saturation N           Color intensity 50-200%% (100=neutral, 150=vivid; default 100)\n"
         "  --bpc N                  Output bit depth: 8, 10, or 12 (default 10)\n"
+        "  --oled-dim-min N         OLED auto-dim timeout in minutes (0=disabled, saved to conf)\n"
+        "  --dim-to N               Set SDR=N peak=N*4 and apply (used by OLED auto-dim service)\n"
         "  --no-vt-switch           Skip VT2 switch — try direct DRM master (headless / boot use)\n"
         "  reset                    Restore SDR (identity pipeline)\n"
+        "  --save-game KEY=VAL ...  Write /etc/hdr-game.conf from KEY=VAL pairs and exit\n"
         "  --help                   Show this message\n"
         "\n"
         "Defaults are auto-configured from EDID (peak nits, gamut) when not set.\n"
         "GPU driver is auto-detected: AMD/Intel = full pipeline; NVIDIA = PQ gamma only.\n"
         "HDMI-CEC: if /dev/cec0 is present, announces active source after HDR enable.\n",
-        argv0);
+        argv0, argv0);
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    int reset = 0, save = 0, sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct;
+    /* --save-game dispatched before any other processing */
+    if (argc >= 2 && strcmp(argv[1], "--save-game") == 0) {
+        if (geteuid() != 0) { fprintf(stderr, "must run as root (pkexec or sudo)\n"); return 1; }
+        return save_game_conf(argc - 1, argv + 1);
+    }
+
+    int reset = 0, save = 0, save_only = 0;
+    int sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct, oled_dim_min;
     int no_vt_switch = 0;
     int explicit_peak = 0, explicit_gamut_mode = 0;
-    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc, &saturation_pct);
+    load_conf(&sdr_nits, &peak_nits, &gamut_pct, &gamut_mode, &max_bpc,
+              &saturation_pct, &oled_dim_min);
 
     char card_path[64] = {0};
     char conn_override[64] = {0};
@@ -471,17 +507,18 @@ int main(int argc, char **argv) {
                          strcmp(m, "srgb")   == 0 ? 2 : 0;
             explicit_gamut_mode = 1;
         }
-        else if (strcmp(argv[i], "--saturation") == 0 && i+1 < argc) saturation_pct = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--dim-to")    == 0 && i+1 < argc) {
+        else if (strcmp(argv[i], "--saturation")   == 0 && i+1 < argc) saturation_pct = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--oled-dim-min") == 0 && i+1 < argc) oled_dim_min   = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--save-only")    == 0) save_only = 1;
+        else if (strcmp(argv[i], "--dim-to")       == 0 && i+1 < argc) {
             /* OLED auto-dim: set both nit values to a low level and apply */
             int n = atoi(argv[++i]);
             sdr_nits  = n;
-            peak_nits = n * 4;  /* keep peak/SDR ratio reasonable */
+            peak_nits = n * 4;
             explicit_peak = 1;
         }
-        /* ignored by kms-hdr, accepted to allow panel to pass them cleanly */
+        /* accepted for forward-compat with panel passthrough */
         else if (strcmp(argv[i], "--oled-preset")  == 0 && i+1 < argc) { ++i; }
-        else if (strcmp(argv[i], "--oled-dim-min") == 0 && i+1 < argc) { ++i; }
         else { fprintf(stderr, "unknown arg: %s  (try --help)\n", argv[i]); return 1; }
     }
 
@@ -489,7 +526,10 @@ int main(int argc, char **argv) {
 
     /* Save config before applying if requested */
     if (save && !reset)
-        save_conf(sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc, saturation_pct);
+        save_conf(sdr_nits, peak_nits, gamut_pct, gamut_mode, max_bpc,
+                  saturation_pct, oled_dim_min);
+
+    if (save_only) return 0;
 
     /* Auto-detect DRM device if not specified */
     char auto_conn[64] = {0};
