@@ -472,6 +472,16 @@ int main(int argc, char **argv) {
             explicit_gamut_mode = 1;
         }
         else if (strcmp(argv[i], "--saturation") == 0 && i+1 < argc) saturation_pct = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dim-to")    == 0 && i+1 < argc) {
+            /* OLED auto-dim: set both nit values to a low level and apply */
+            int n = atoi(argv[++i]);
+            sdr_nits  = n;
+            peak_nits = n * 4;  /* keep peak/SDR ratio reasonable */
+            explicit_peak = 1;
+        }
+        /* ignored by kms-hdr, accepted to allow panel to pass them cleanly */
+        else if (strcmp(argv[i], "--oled-preset")  == 0 && i+1 < argc) { ++i; }
+        else if (strcmp(argv[i], "--oled-dim-min") == 0 && i+1 < argc) { ++i; }
         else { fprintf(stderr, "unknown arg: %s  (try --help)\n", argv[i]); return 1; }
     }
 
