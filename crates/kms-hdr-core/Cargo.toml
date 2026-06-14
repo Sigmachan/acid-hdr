@@ -1,0 +1,13 @@
+[package]
+name = "kms-hdr-core"
+description = "Shared logic for the kms-hdr stack: conf I/O, EDID parsing, GPU detection, calibration profiles, and injector invocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

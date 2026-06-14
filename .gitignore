@@ -1,2 +1,7 @@
-acid-hdr
+/target
+**/*.rs.bk
+core/kms-hdr
+core/hdr-game.o
 *.o
+__pycache__/
+.ruff_cache/

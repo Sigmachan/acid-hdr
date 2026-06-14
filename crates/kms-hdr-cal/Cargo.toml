@@ -1,0 +1,16 @@
+[package]
+name = "kms-hdr-cal"
+description = "Native GTK4 HDR/colour calibration wizard for the kms-hdr injector."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "kms-hdr-cal"
+path = "src/main.rs"
+
+[dependencies]
+kms-hdr-core = { workspace = true }
+gtk4 = { version = "0.11", features = ["v4_12"] }

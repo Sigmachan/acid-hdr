@@ -6,7 +6,7 @@ LIBS    := $(shell pkg-config --libs libdrm) -lm
 
 all: kms-hdr
 
-kms-hdr: cosmic-hdr.c
+kms-hdr: kms-hdr.c
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 
 CALDIR  ?= /usr/local/lib/kms-hdr
