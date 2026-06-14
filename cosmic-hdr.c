@@ -76,7 +76,7 @@ typedef struct {
 /* ── conf I/O ────────────────────────────────────────────────────────────── */
 static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
                       int *gamut_mode, int *max_bpc, int *saturation,
-                      int *oled_dim_min, int *midtone_gamma) {
+                      int *oled_dim_min, int *midtone_gamma, int *force_oled) {
     *sdr_nits      = DEFAULT_SDR_NITS;
     *peak_nits     = DEFAULT_PEAK_NITS;
     *gamut_pct     = DEFAULT_GAMUT;
@@ -85,6 +85,7 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
     *saturation    = DEFAULT_SATURATION;
     *oled_dim_min  = 0;
     *midtone_gamma = DEFAULT_MIDTONE_GAMMA;
+    *force_oled    = 0;
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
     char line[256];
@@ -97,6 +98,7 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
         if (sscanf(line, "SATURATION=%d",    &v) == 1) *saturation    = v;
         if (sscanf(line, "OLED_DIM_MIN=%d",  &v) == 1) *oled_dim_min  = v;
         if (sscanf(line, "MIDTONE_GAMMA=%d", &v) == 1) *midtone_gamma = v;
+        if (sscanf(line, "FORCE_OLED=%d",    &v) == 1) *force_oled    = v;
         if (sscanf(line, "GAMUT_MODE=%63s",   s) == 1)
             *gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 : 0;
     }
@@ -105,15 +107,15 @@ static void load_conf(int *sdr_nits, int *peak_nits, int *gamut_pct,
 
 static void save_conf(int sdr_nits, int peak_nits, int gamut_pct,
                       int gamut_mode, int max_bpc, int saturation,
-                      int oled_dim_min, int midtone_gamma) {
+                      int oled_dim_min, int midtone_gamma, int force_oled) {
     FILE *f = fopen(CONF_PATH, "w");
     if (!f) { perror("save_conf: fopen " CONF_PATH); return; }
     fprintf(f,
         "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\n"
-        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\n",
+        "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\nFORCE_OLED=%d\n",
         sdr_nits, peak_nits, gamut_pct, max_bpc,
         gamut_mode == 1 ? "dci-p3" : (gamut_mode == 2 ? "srgb" : "bt2020"),
-        saturation, oled_dim_min, midtone_gamma);
+        saturation, oled_dim_min, midtone_gamma, force_oled);
     fclose(f);
     printf("saved: %s\n", CONF_PATH);
 }
@@ -831,8 +833,8 @@ static void run_daemon(ApplyCtx *base_ctx) {
 
         if (triggered) {
             g_reload = 0;
-            int sn, pn, gp, gm, bpc, sat, odm, mtg;
-            load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg);
+            int sn, pn, gp, gm, bpc, sat, odm, mtg, fo;
+            load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg, &fo);
             ApplyCtx ctx = *base_ctx;
             ctx.sdr_nits      = sn;
             ctx.peak_nits     = pn;
@@ -884,12 +886,12 @@ int main(int argc, char **argv) {
     ctx.midtone_gamma  = DEFAULT_MIDTONE_GAMMA;
 
     int save = 0, save_only = 0, daemon_mode = 0;
-    int oled_dim_min = 0;
+    int oled_dim_min = 0, force_oled = 0;
 
     /* Load defaults from conf */
     {
-        int sn, pn, gp, gm, bpc, sat, odm, mtg;
-        load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg);
+        int sn, pn, gp, gm, bpc, sat, odm, mtg, fo;
+        load_conf(&sn, &pn, &gp, &gm, &bpc, &sat, &odm, &mtg, &fo);
         ctx.sdr_nits       = sn;
         ctx.peak_nits      = pn;
         ctx.gamut_pct      = gp;
@@ -898,6 +900,7 @@ int main(int argc, char **argv) {
         ctx.saturation_pct = sat;
         ctx.midtone_gamma  = mtg;
         oled_dim_min = odm;
+        force_oled   = fo;
     }
 
     for (int i = 1; i < argc; i++) {
@@ -921,6 +924,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--saturation")    == 0 && i+1 < argc) ctx.saturation_pct = atoi(argv[++i]);
         else if (strcmp(argv[i], "--midtone-gamma") == 0 && i+1 < argc) ctx.midtone_gamma  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--oled-dim-min")  == 0 && i+1 < argc) oled_dim_min       = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--force-oled")    == 0 && i+1 < argc) force_oled         = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gamut-mode")    == 0 && i+1 < argc) {
             const char *m = argv[++i];
             ctx.gamut_mode = strcmp(m, "dci-p3") == 0 ? 1 :
@@ -942,7 +946,7 @@ int main(int argc, char **argv) {
 
     if ((save || save_only) && !ctx.reset)
         save_conf(ctx.sdr_nits, ctx.peak_nits, ctx.gamut_pct, ctx.gamut_mode,
-                  ctx.max_bpc, ctx.saturation_pct, oled_dim_min, ctx.midtone_gamma);
+                  ctx.max_bpc, ctx.saturation_pct, oled_dim_min, ctx.midtone_gamma, force_oled);
 
     if (save_only) return 0;
 
