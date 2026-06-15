@@ -78,6 +78,7 @@ typedef struct {
     int black_lift;      /* 0..100 shadow floor lift */
     int tonemap;         /* 0=clip, 1=soft roll-off */
     int tonemap_knee;    /* 0..100 roll-off start */
+    int auto_engage;     /* 1=Automatic (daemon enables HDR from EDID), 0=Manual */
 } KmsConf;
 
 static void conf_defaults(KmsConf *c) {
@@ -95,6 +96,7 @@ static void conf_defaults(KmsConf *c) {
     c->black_lift    = DEFAULT_BLACK_LIFT;
     c->tonemap       = DEFAULT_TONEMAP;
     c->tonemap_knee  = DEFAULT_TONEMAP_KNEE;
+    c->auto_engage   = 1;   /* Automatic by default — "it just works" */
 }
 
 /* ── apply context ────────────────────────────────────────────────────────── */
@@ -140,6 +142,7 @@ static void load_conf(KmsConf *c) {
         if (sscanf(line, "BLACK_LIFT=%d",    &v) == 1) c->black_lift    = v;
         if (sscanf(line, "TONEMAP=%d",       &v) == 1) c->tonemap       = v;
         if (sscanf(line, "TONEMAP_KNEE=%d",  &v) == 1) c->tonemap_knee  = v;
+        if (sscanf(line, "AUTO=%d",          &v) == 1) c->auto_engage   = v;
         if (sscanf(line, "GAMUT_MODE=%63s",   s) == 1)
             c->gamut_mode = (strncmp(s, "dci-p3", 6) == 0) ? 1 :
                             (strncmp(s, "srgb",   4) == 0) ? 2 : 0;
@@ -154,11 +157,12 @@ static void save_conf(const KmsConf *c) {
     int n = fprintf(f,
         "SDR_NITS=%d\nPEAK_NITS=%d\nGAMUT=%d\nMAX_BPC=%d\n"
         "GAMUT_MODE=%s\nSATURATION=%d\nOLED_DIM_MIN=%d\nMIDTONE_GAMMA=%d\nFORCE_OLED=%d\n"
-        "WHITE_TEMP=%d\nWHITE_TINT=%d\nBLACK_LIFT=%d\nTONEMAP=%d\nTONEMAP_KNEE=%d\n",
+        "WHITE_TEMP=%d\nWHITE_TINT=%d\nBLACK_LIFT=%d\nTONEMAP=%d\nTONEMAP_KNEE=%d\nAUTO=%d\n",
         c->sdr_nits, c->peak_nits, c->gamut_pct, c->max_bpc,
         c->gamut_mode == 1 ? "dci-p3" : (c->gamut_mode == 2 ? "srgb" : "bt2020"),
         c->saturation, c->oled_dim_min, c->midtone_gamma, c->force_oled,
-        c->white_temp, c->white_tint, c->black_lift, c->tonemap, c->tonemap_knee);
+        c->white_temp, c->white_tint, c->black_lift, c->tonemap, c->tonemap_knee,
+        c->auto_engage);
     if (n < 0) { perror("save_conf: fprintf"); fclose(f); unlink(tmp); return; }
     fflush(f);
     fsync(fileno(f));
@@ -266,6 +270,31 @@ static int parse_edid_caps(const char *path,
         }
     }
     return 0;
+}
+
+/* ── auto-engage detection ───────────────────────────────────────────────── */
+/* Returns 1 if the connected display advertises HDR in its EDID (peak
+ * luminance, BT.2020, or DCI-P3); 0 otherwise. Lets --auto decide whether to
+ * turn HDR on with zero user interaction — the "mac way". */
+static int auto_should_enable(int *peak_out, int *bt2020_out, int *dcip3_out) {
+    char card_path[64], conn_buf[64];
+    if (find_drm_device(card_path, sizeof(card_path),
+                        conn_buf, sizeof(conn_buf)) != 0)
+        return 0;
+
+    char sysfs_edid[512];
+    const char *cname = strrchr(card_path, '/');
+    cname = cname ? cname + 1 : card_path;
+    snprintf(sysfs_edid, sizeof(sysfs_edid),
+             "/sys/class/drm/%s-%s/edid", cname, conn_buf);
+
+    int peak = 0, bt2020 = 0, dcip3 = 0;
+    if (parse_edid_caps(sysfs_edid, &peak, &bt2020, &dcip3) != 0)
+        return 0;
+    if (peak_out)   *peak_out   = peak;
+    if (bt2020_out) *bt2020_out = bt2020;
+    if (dcip3_out)  *dcip3_out  = dcip3;
+    return (peak > 0 || bt2020 || dcip3) ? 1 : 0;
 }
 
 /* ── LUT helpers ─────────────────────────────────────────────────────────── */
@@ -615,6 +644,9 @@ static void usage(const char *argv0) {
         "  --dim-to N               Set SDR=N peak=N*4 and apply (OLED auto-dim use)\n"
         "  --no-vt-switch           Skip VT2 switch — try direct DRM master\n"
         "  --daemon                 Apply and stay alive; re-apply on SIGUSR1\n"
+        "  --auto                   Enable HDR only if the display is HDR-capable\n"
+        "                           and Automatic mode is on (login/hotplug hook)\n"
+        "  --set-auto N             Set Automatic mode (1=auto, 0=manual); use with --save\n"
         "  --reload                 Send SIGUSR1 to running daemon via " PID_FILE "\n"
         "  reset                    Restore SDR (identity pipeline)\n"
         "  --save-game KEY=VAL ...  Write /etc/hdr-game.conf from KEY=VAL pairs and exit\n"
@@ -1154,7 +1186,7 @@ int main(int argc, char **argv) {
     ApplyCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    int save = 0, save_only = 0, daemon_mode = 0;
+    int save = 0, save_only = 0, daemon_mode = 0, auto_mode = 0;
 
     /* Load defaults from conf (falls back to built-in defaults if absent) */
     KmsConf conf;
@@ -1162,6 +1194,7 @@ int main(int argc, char **argv) {
     ctx_apply_conf(&ctx, &conf);
     int oled_dim_min = conf.oled_dim_min;
     int force_oled   = conf.force_oled;
+    int auto_engage  = conf.auto_engage;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "reset")            == 0) ctx.reset         = 1;
@@ -1171,6 +1204,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--save-only")       == 0) save_only        = 1;
         else if (strcmp(argv[i], "--no-vt-switch")    == 0) ctx.no_vt_switch = 1;
         else if (strcmp(argv[i], "--daemon")          == 0) daemon_mode      = 1;
+        else if (strcmp(argv[i], "--auto")            == 0) auto_mode        = 1;
+        else if (strcmp(argv[i], "--set-auto")        == 0 && i+1 < argc) auto_engage = atoi(argv[++i]);
         else if ((strcmp(argv[i], "--card")   == 0 ||
                   strcmp(argv[i], "--output") == 0) && i+1 < argc)
             snprintf(ctx.card_path, sizeof(ctx.card_path), "%s", argv[++i]);
@@ -1222,11 +1257,30 @@ int main(int argc, char **argv) {
             .force_oled = force_oled, .white_temp = ctx.white_temp,
             .white_tint = ctx.white_tint, .black_lift = ctx.black_lift,
             .tonemap = ctx.tonemap, .tonemap_knee = ctx.tonemap_knee,
+            .auto_engage = auto_engage,
         };
         save_conf(&out);
     }
 
     if (save_only) return 0;
+
+    /* Automatic engage: only enable HDR when the connected display advertises
+     * it and the user hasn't switched to Manual. Safe to run on every hotplug
+     * and at login — this is the "mac way" path. */
+    if (auto_mode) {
+        if (!conf.auto_engage) {
+            printf("[kms-hdr] Automatic mode off (Manual); not engaging HDR\n");
+            return 0;
+        }
+        int peak = 0, bt2020 = 0, dcip3 = 0;
+        if (!auto_should_enable(&peak, &bt2020, &dcip3)) {
+            printf("[kms-hdr] no HDR-capable display detected; staying SDR\n");
+            return 0;
+        }
+        printf("[kms-hdr] HDR display detected (peak=%d nits  BT.2020=%s  DCI-P3=%s) — engaging\n",
+               peak, bt2020 ? "yes" : "no", dcip3 ? "yes" : "no");
+        /* fall through to do_apply; EDID auto-config fills peak/gamut */
+    }
 
     int ret = do_apply(&ctx);
 

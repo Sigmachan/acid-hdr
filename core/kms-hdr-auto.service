@@ -1,0 +1,10 @@
+[Unit]
+Description=kms-hdr automatic HDR engage (display hotplug)
+Documentation=https://github.com/Sigmachan/kms-hdr
+After=display-manager.service
+
+[Service]
+Type=oneshot
+# Engages HDR only when the freshly-connected display is HDR-capable and
+# Automatic mode is on; otherwise exits 0 leaving SDR untouched.
+ExecStart=/usr/local/bin/kms-hdr --auto --no-vt-switch

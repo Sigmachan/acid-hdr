@@ -1,0 +1,4 @@
+# Re-evaluate HDR whenever a display is hot-plugged or its EDID changes.
+# kms-hdr --auto only engages HDR if the new display is HDR-capable and the
+# user hasn't switched to Manual, so this is safe to fire on every drm change.
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", RUN+="/usr/bin/systemctl --no-block restart kms-hdr-auto.service"

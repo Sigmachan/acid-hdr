@@ -1,6 +1,7 @@
 PREFIX  ?= /usr/local
 SVCDIR  ?= /usr/lib/systemd/system
 POLKIT  ?= /usr/share/polkit-1/actions
+UDEVDIR ?= /usr/lib/udev/rules.d
 CFLAGS  := -O2 $(shell pkg-config --cflags libdrm)
 LIBS    := $(shell pkg-config --libs libdrm) -lm
 
@@ -13,10 +14,13 @@ install: kms-hdr
 	install -Dm755 kms-hdr                      $(DESTDIR)$(PREFIX)/bin/kms-hdr
 	install -Dm755 hdr-game                     $(DESTDIR)$(PREFIX)/bin/hdr-game
 	install -Dm644 kms-hdr.service              $(DESTDIR)$(SVCDIR)/kms-hdr.service
+	install -Dm644 kms-hdr-auto.service         $(DESTDIR)$(SVCDIR)/kms-hdr-auto.service
+	install -Dm644 99-kms-hdr-auto.rules        $(DESTDIR)$(UDEVDIR)/99-kms-hdr-auto.rules
 	install -Dm644 kms-hdr.policy               $(DESTDIR)$(POLKIT)/ru.sigmachan.kms-hdr.policy
 
 enable: install
 	systemctl daemon-reload
+	udevadm control --reload-rules || true
 	systemctl enable --now kms-hdr.service
 
 disable:
@@ -26,8 +30,11 @@ uninstall: disable
 	rm -f $(DESTDIR)$(PREFIX)/bin/kms-hdr
 	rm -f $(DESTDIR)$(PREFIX)/bin/hdr-game
 	rm -f $(DESTDIR)$(SVCDIR)/kms-hdr.service
+	rm -f $(DESTDIR)$(SVCDIR)/kms-hdr-auto.service
+	rm -f $(DESTDIR)$(UDEVDIR)/99-kms-hdr-auto.rules
 	rm -f $(DESTDIR)$(POLKIT)/ru.sigmachan.kms-hdr.policy
 	systemctl daemon-reload
+	udevadm control --reload-rules || true
 
 clean:
 	rm -f kms-hdr

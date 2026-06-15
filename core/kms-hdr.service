@@ -7,7 +7,10 @@ Wants=display-manager.service
 [Service]
 Type=simple
 PIDFile=/run/kms-hdr.pid
-ExecStart=/usr/local/bin/kms-hdr --daemon
+# --auto: only engage HDR when the display is HDR-capable and Automatic mode
+# is on. On an SDR display or in Manual mode it exits 0 without touching the
+# pipeline. --daemon keeps it alive to re-apply on SIGUSR1 once HDR is on.
+ExecStart=/usr/local/bin/kms-hdr --auto --daemon
 ExecStop=/usr/local/bin/kms-hdr reset
 Restart=on-failure
 RestartSec=3s
